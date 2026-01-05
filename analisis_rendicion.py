@@ -48,6 +48,21 @@ class AnalysisError(Exception):
     pass
 
 
+def discover_rendicion_csvs(base_dir: Path) -> List[Path]:
+    preferred: List[Path] = []
+    fallback: List[Path] = []
+    for path in base_dir.rglob("*.csv"):
+        normalized = str(path).casefold()
+        if "rendición" not in normalized and "rendicion" not in normalized:
+            continue
+        if path.name.startswith("ArchivoC_Adm"):
+            preferred.append(path)
+        else:
+            fallback.append(path)
+    candidates = preferred or fallback
+    return sorted(candidates)
+
+
 def sniff_dialect(path: Path) -> csv.Dialect:
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         sample = handle.read(4096)
@@ -276,6 +291,45 @@ def prompt_value(label: str, default: Optional[str] = None) -> str:
     return input(f"{label}{suffix}: ").strip() or (default or "")
 
 
+def prompt_choice(label: str, options: List[str], default: Optional[int] = None) -> int:
+    print(label)
+    for idx, option in enumerate(options, start=1):
+        print(f"{idx}. {option}")
+    while True:
+        raw = input(
+            "Selecciona una opción"
+            + (f" [{default}]" if default else "")
+            + ": "
+        ).strip()
+        if not raw and default is not None:
+            return default
+        if raw.isdigit():
+            selection = int(raw)
+            if 1 <= selection <= len(options):
+                return selection
+        print("Selección inválida. Intenta nuevamente.")
+
+
+def prompt_data_file(default_path: str) -> str:
+    candidates = discover_rendicion_csvs(Path.cwd())
+    if not candidates:
+        return prompt_value("Ruta del CSV principal", default_path)
+    display = [str(path.relative_to(Path.cwd())) for path in candidates]
+    default_index = None
+    default_path_obj = Path(default_path)
+    if default_path_obj in candidates:
+        default_index = candidates.index(default_path_obj) + 1
+    display.append("Ingresar otra ruta manualmente")
+    selection = prompt_choice(
+        "Archivos de rendición disponibles:",
+        display,
+        default=default_index,
+    )
+    if selection == len(display):
+        return prompt_value("Ruta del CSV principal", default_path)
+    return str(candidates[selection - 1])
+
+
 def prompt_list_filter(label: str, current: Optional[str]) -> Optional[str]:
     if current:
         return current
@@ -332,10 +386,210 @@ def prompt_count_by(existing: List[str], fieldnames: List[str]) -> List[str]:
     return [item for item in requested if item in fieldnames]
 
 
-def maybe_collect_interactive(args: argparse.Namespace, fieldnames: List[str]) -> None:
-    if not (args.interactive or len(sys.argv) == 1):
+def summarize_filters(
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+) -> None:
+    print("\nFiltros actuales:")
+    if not column_filters and not min_scores and not max_scores:
+        print("- (sin filtros)")
         return
+    for column, values in sorted(column_filters.items()):
+        if values:
+            joined = ", ".join(sorted(values))
+            print(f"- {column} en [{joined}]")
+    for column, threshold in sorted(min_scores.items()):
+        print(f"- {column} >= {threshold}")
+    for column, threshold in sorted(max_scores.items()):
+        print(f"- {column} <= {threshold}")
 
+
+def build_filter_index(
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+) -> List[Tuple[str, str]]:
+    index: List[Tuple[str, str]] = []
+    for column in sorted(column_filters):
+        index.append(("igual", column))
+    for column in sorted(min_scores):
+        index.append(("min", column))
+    for column in sorted(max_scores):
+        index.append(("max", column))
+    return index
+
+
+def prompt_column(fieldnames: List[str]) -> str:
+    selection = prompt_choice("Selecciona una columna:", fieldnames)
+    return fieldnames[selection - 1]
+
+
+def prompt_column_value(column: str) -> set[str]:
+    raw = input(
+        f"Valores para {column} (separados por coma, Enter para cancelar): "
+    ).strip()
+    if not raw:
+        return set()
+    return {value.strip() for value in raw.split(",") if value.strip()}
+
+
+def prompt_threshold(column: str) -> Optional[float]:
+    raw = input(f"Valor numérico para {column} (Enter para cancelar): ").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        print("Número inválido.")
+        return None
+
+
+def count_filtered_rows(
+    data_path: Path,
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    sample_size: int = 5,
+) -> None:
+    fieldnames, rows = read_csv_rows(data_path)
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    total_rows = 0
+    matched_rows = 0
+    samples: List[Dict[str, str]] = []
+    for row in rows:
+        total_rows += 1
+        if not row_matches(row, column_filters, min_list, max_list):
+            continue
+        matched_rows += 1
+        if len(samples) < sample_size:
+            samples.append(row)
+    print("\nResumen con filtros actuales:")
+    print(f"- Total de registros: {total_rows}")
+    print(f"- Registros filtrados: {matched_rows}")
+    if samples:
+        print("\nPrimeras filas filtradas:")
+        for idx, row in enumerate(samples, start=1):
+            values = ", ".join(f"{col}={row.get(col, '')}" for col in fieldnames)
+            print(f"{idx}. {values}")
+    else:
+        print("\nNo hay filas filtradas para mostrar.")
+
+
+def manage_filters(
+    fieldnames: List[str],
+    data_path: Path,
+    initial_column_filters: Dict[str, set[str]],
+    initial_min_scores: Dict[str, float],
+    initial_max_scores: Dict[str, float],
+) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float]]:
+    column_filters = dict(initial_column_filters)
+    min_scores = dict(initial_min_scores)
+    max_scores = dict(initial_max_scores)
+    while True:
+        summarize_filters(column_filters, min_scores, max_scores)
+        print(
+            "\n¿Qué deseas hacer ahora?\n"
+            "1. Agregar filtro\n"
+            "2. Modificar filtro\n"
+            "3. Eliminar filtro\n"
+            "4. Reiniciar filtros\n"
+            "5. Mostrar datos actuales\n"
+            "6. Continuar"
+        )
+        choice = input("Selecciona una opción: ").strip()
+        if choice == "1":
+            print("\nTipos de filtro:")
+            print("1. Valores exactos")
+            print("2. Mínimo")
+            print("3. Máximo")
+            filter_type = input("Selecciona el tipo: ").strip()
+            if filter_type == "1":
+                column = prompt_column(fieldnames)
+                values = prompt_column_value(column)
+                if values:
+                    column_filters[column] = values
+            elif filter_type == "2":
+                column = prompt_column(fieldnames)
+                threshold = prompt_threshold(column)
+                if threshold is not None:
+                    min_scores[column] = threshold
+            elif filter_type == "3":
+                column = prompt_column(fieldnames)
+                threshold = prompt_threshold(column)
+                if threshold is not None:
+                    max_scores[column] = threshold
+            else:
+                print("Tipo inválido.")
+        elif choice == "2":
+            index = build_filter_index(column_filters, min_scores, max_scores)
+            if not index:
+                print("No hay filtros para modificar.")
+                continue
+            options = []
+            for kind, column in index:
+                label = (
+                    f"{column} en [{', '.join(sorted(column_filters.get(column, [])))}]"
+                    if kind == "igual"
+                    else f"{column} {'>=' if kind == 'min' else '<='} "
+                    f"{min_scores.get(column) if kind == 'min' else max_scores.get(column)}"
+                )
+                options.append(label)
+            selection = prompt_choice("Selecciona el filtro a modificar:", options)
+            kind, column = index[selection - 1]
+            if kind == "igual":
+                values = prompt_column_value(column)
+                if values:
+                    column_filters[column] = values
+            elif kind == "min":
+                threshold = prompt_threshold(column)
+                if threshold is not None:
+                    min_scores[column] = threshold
+            elif kind == "max":
+                threshold = prompt_threshold(column)
+                if threshold is not None:
+                    max_scores[column] = threshold
+        elif choice == "3":
+            index = build_filter_index(column_filters, min_scores, max_scores)
+            if not index:
+                print("No hay filtros para eliminar.")
+                continue
+            options = []
+            for kind, column in index:
+                label = (
+                    f"{column} en [{', '.join(sorted(column_filters.get(column, [])))}]"
+                    if kind == "igual"
+                    else f"{column} {'>=' if kind == 'min' else '<='} "
+                    f"{min_scores.get(column) if kind == 'min' else max_scores.get(column)}"
+                )
+                options.append(label)
+            selection = prompt_choice("Selecciona el filtro a eliminar:", options)
+            kind, column = index[selection - 1]
+            if kind == "igual":
+                column_filters.pop(column, None)
+            elif kind == "min":
+                min_scores.pop(column, None)
+            elif kind == "max":
+                max_scores.pop(column, None)
+        elif choice == "4":
+            if prompt_yes_no("¿Seguro que deseas reiniciar los filtros?", default=False):
+                column_filters.clear()
+                min_scores.clear()
+                max_scores.clear()
+        elif choice == "5":
+            count_filtered_rows(data_path, column_filters, min_scores, max_scores)
+        elif choice == "6":
+            return column_filters, min_scores, max_scores
+        else:
+            print("Opción inválida.")
+
+
+def collect_interactive_filters(
+    args: argparse.Namespace,
+    fieldnames: List[str],
+    data_path: Path,
+) -> Tuple[Dict[str, set[str]], List[ScoreFilter], List[ScoreFilter]]:
     print("=== Modo interactivo: análisis de rendición ===")
 
     if prompt_yes_no("¿Deseas ver las columnas disponibles?", default=False):
@@ -343,22 +597,36 @@ def maybe_collect_interactive(args: argparse.Namespace, fieldnames: List[str]) -
         for name in fieldnames:
             print(f"- {name}")
 
-    args.rbd = prompt_list_filter("Filtro por RBD", args.rbd)
-    args.situacion_egreso = prompt_list_filter(
-        "Filtro por SITUACION_EGRESO", args.situacion_egreso
-    )
-    args.cod_ens = prompt_list_filter("Filtro por COD_ENS", args.cod_ens)
-    args.region = prompt_list_filter("Filtro por CODIGO_REGION", args.region)
-    args.comuna = prompt_list_filter("Filtro por CODIGO_COMUNA", args.comuna)
-    args.grupo_dependencia = prompt_list_filter(
-        "Filtro por GRUPO_DEPENDENCIA", args.grupo_dependencia
-    )
-    args.rama_educacional = prompt_list_filter(
-        "Filtro por RAMA_EDUCACIONAL", args.rama_educacional
-    )
+    initial_filters = {}
+    if args.rbd:
+        initial_filters["RBD"] = parse_list_arg(args.rbd) or set()
+    if args.situacion_egreso:
+        initial_filters["SITUACION_EGRESO"] = parse_list_arg(args.situacion_egreso) or set()
+    if args.cod_ens:
+        initial_filters["COD_ENS"] = parse_list_arg(args.cod_ens) or set()
+    if args.region:
+        initial_filters["CODIGO_REGION"] = parse_list_arg(args.region) or set()
+    if args.comuna:
+        initial_filters["CODIGO_COMUNA"] = parse_list_arg(args.comuna) or set()
+    if args.grupo_dependencia:
+        initial_filters["GRUPO_DEPENDENCIA"] = (
+            parse_list_arg(args.grupo_dependencia) or set()
+        )
+    if args.rama_educacional:
+        initial_filters["RAMA_EDUCACIONAL"] = (
+            parse_list_arg(args.rama_educacional) or set()
+        )
 
-    args.min_score = prompt_score_filters("mínimos", args.min_score, fieldnames)
-    args.max_score = prompt_score_filters("máximos", args.max_score, fieldnames)
+    min_scores = {f.column: f.threshold for f in parse_score_filters(args.min_score)}
+    max_scores = {f.column: f.threshold for f in parse_score_filters(args.max_score)}
+
+    column_filters, min_scores, max_scores = manage_filters(
+        fieldnames,
+        data_path,
+        initial_filters,
+        min_scores,
+        max_scores,
+    )
 
     args.count_by = prompt_count_by(args.count_by, fieldnames)
 
@@ -368,38 +636,44 @@ def maybe_collect_interactive(args: argparse.Namespace, fieldnames: List[str]) -
     if not args.add_labels:
         args.add_labels = prompt_yes_no("¿Agregar columnas descriptivas?", default=False)
 
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    return column_filters, min_list, max_list
+
 
 def main() -> None:
     args = parse_args()
     if args.interactive or len(sys.argv) == 1:
-        data_input = prompt_value("Ruta del CSV principal", args.data)
-        args.data = data_input or args.data
+        args.data = prompt_data_file(args.data)
     data_path = Path(args.data)
     if not data_path.exists():
         raise AnalysisError(f"No se encontró el archivo de datos: {data_path}")
 
     fieldnames, rows = read_csv_rows(data_path)
-    maybe_collect_interactive(args, fieldnames)
     if args.list_columns:
         print("Columnas disponibles:")
         for name in fieldnames:
             print(f"- {name}")
         return
 
+    if args.interactive or len(sys.argv) == 1:
+        column_filters, min_scores, max_scores = collect_interactive_filters(
+            args, fieldnames, data_path
+        )
+    else:
+        column_filters = {
+            "RBD": parse_list_arg(args.rbd),
+            "SITUACION_EGRESO": parse_list_arg(args.situacion_egreso),
+            "COD_ENS": parse_list_arg(args.cod_ens),
+            "CODIGO_REGION": parse_list_arg(args.region),
+            "CODIGO_COMUNA": parse_list_arg(args.comuna),
+            "GRUPO_DEPENDENCIA": parse_list_arg(args.grupo_dependencia),
+            "RAMA_EDUCACIONAL": parse_list_arg(args.rama_educacional),
+        }
+        min_scores = parse_score_filters(args.min_score)
+        max_scores = parse_score_filters(args.max_score)
+
     maps = build_code_maps(Path(args.cod_ens_csv), Path(args.comunas_csv))
-
-    column_filters = {
-        "RBD": parse_list_arg(args.rbd),
-        "SITUACION_EGRESO": parse_list_arg(args.situacion_egreso),
-        "COD_ENS": parse_list_arg(args.cod_ens),
-        "CODIGO_REGION": parse_list_arg(args.region),
-        "CODIGO_COMUNA": parse_list_arg(args.comuna),
-        "GRUPO_DEPENDENCIA": parse_list_arg(args.grupo_dependencia),
-        "RAMA_EDUCACIONAL": parse_list_arg(args.rama_educacional),
-    }
-
-    min_scores = parse_score_filters(args.min_score)
-    max_scores = parse_score_filters(args.max_score)
 
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
 
