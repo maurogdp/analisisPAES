@@ -200,8 +200,6 @@ def label_value(column: str, value: str, maps: CodeMaps) -> str:
         return f"{value} - {maps.cod_ens[value]}"
     if column == "CODIGO_REGION" and value in maps.regiones:
         return f"{value} - {maps.regiones[value]}"
-    if column == "CODIGO_COMUNA" and value in maps.comunas:
-        return f"{value} - {maps.comunas[value]}"
     return value
 
 
