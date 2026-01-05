@@ -450,31 +450,34 @@ def count_filtered_rows(
     column_filters: Dict[str, set[str]],
     min_scores: Dict[str, float],
     max_scores: Dict[str, float],
-    sample_size: int = 5,
 ) -> None:
     fieldnames, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     total_rows = 0
     matched_rows = 0
-    samples: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         if not row_matches(row, column_filters, min_list, max_list):
             continue
         matched_rows += 1
-        if len(samples) < sample_size:
-            samples.append(row)
     print("\nResumen con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
-    if samples:
-        print("\nPrimeras filas filtradas:")
-        for idx, row in enumerate(samples, start=1):
-            values = ", ".join(f"{col}={row.get(col, '')}" for col in fieldnames)
-            print(f"{idx}. {values}")
-    else:
+    if matched_rows == 0:
         print("\nNo hay filas filtradas para mostrar.")
+        return
+
+    print("\nFilas filtradas (ordenadas por el archivo):")
+    _, rows = read_csv_rows(data_path)
+    row_index = 0
+    for row in rows:
+        if not row_matches(row, column_filters, min_list, max_list):
+            continue
+        row_index += 1
+        print(f"\nFila {row_index}:")
+        for col in fieldnames:
+            print(f"  - {col}: {row.get(col, '')}")
 
 
 def manage_filters(
