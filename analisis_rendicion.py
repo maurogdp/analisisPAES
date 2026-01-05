@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -215,6 +216,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analiza archivos de rendición con filtros y recuentos.",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Inicia un modo interactivo para elegir filtros y opciones.",
+    )
     parser.add_argument("--data", default=DEFAULT_DATA, help="Ruta al CSV principal.")
     parser.add_argument(
         "--cod-ens-csv",
@@ -265,13 +271,115 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def prompt_value(label: str, default: Optional[str] = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    return input(f"{label}{suffix}: ").strip() or (default or "")
+
+
+def prompt_list_filter(label: str, current: Optional[str]) -> Optional[str]:
+    if current:
+        return current
+    raw = input(f"{label} (valores separados por coma, Enter para omitir): ").strip()
+    return raw or None
+
+
+def prompt_yes_no(label: str, default: bool = False) -> bool:
+    default_label = "s" if default else "n"
+    while True:
+        raw = input(f"{label} (s/n) [{default_label}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"s", "si", "sí"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Respuesta inválida. Usa 's' o 'n'.")
+
+
+def prompt_score_filters(kind: str, existing: List[str], fieldnames: List[str]) -> List[str]:
+    if existing:
+        return existing
+    filters: List[str] = []
+    print(f"\nIngresa filtros {kind} en formato COLUMNA=NUMERO. Enter para terminar.")
+    print("Ejemplo: CLEC_REG_ACTUAL=500")
+    while True:
+        raw = input("> ").strip()
+        if not raw:
+            break
+        if "=" not in raw:
+            print("Formato inválido. Usa COLUMNA=NUMERO.")
+            continue
+        column, _ = raw.split("=", 1)
+        if column.strip() not in fieldnames:
+            print(f"Columna desconocida: {column.strip()}")
+            continue
+        filters.append(raw)
+    return filters
+
+
+def prompt_count_by(existing: List[str], fieldnames: List[str]) -> List[str]:
+    if existing:
+        return existing
+    raw = input(
+        "Columnas para agrupar (separadas por coma, Enter para omitir): "
+    ).strip()
+    if not raw:
+        return []
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    invalid = [item for item in requested if item not in fieldnames]
+    if invalid:
+        print(f"Columnas inválidas ignoradas: {', '.join(invalid)}")
+    return [item for item in requested if item in fieldnames]
+
+
+def maybe_collect_interactive(args: argparse.Namespace, fieldnames: List[str]) -> None:
+    if not (args.interactive or len(sys.argv) == 1):
+        return
+
+    print("=== Modo interactivo: análisis de rendición ===")
+
+    if prompt_yes_no("¿Deseas ver las columnas disponibles?", default=False):
+        print("\nColumnas disponibles:")
+        for name in fieldnames:
+            print(f"- {name}")
+
+    args.rbd = prompt_list_filter("Filtro por RBD", args.rbd)
+    args.situacion_egreso = prompt_list_filter(
+        "Filtro por SITUACION_EGRESO", args.situacion_egreso
+    )
+    args.cod_ens = prompt_list_filter("Filtro por COD_ENS", args.cod_ens)
+    args.region = prompt_list_filter("Filtro por CODIGO_REGION", args.region)
+    args.comuna = prompt_list_filter("Filtro por CODIGO_COMUNA", args.comuna)
+    args.grupo_dependencia = prompt_list_filter(
+        "Filtro por GRUPO_DEPENDENCIA", args.grupo_dependencia
+    )
+    args.rama_educacional = prompt_list_filter(
+        "Filtro por RAMA_EDUCACIONAL", args.rama_educacional
+    )
+
+    args.min_score = prompt_score_filters("mínimos", args.min_score, fieldnames)
+    args.max_score = prompt_score_filters("máximos", args.max_score, fieldnames)
+
+    args.count_by = prompt_count_by(args.count_by, fieldnames)
+
+    if not args.output_csv and prompt_yes_no("¿Deseas exportar los filtrados a CSV?"):
+        args.output_csv = prompt_value("Ruta del CSV de salida", "filtrados.csv")
+
+    if not args.add_labels:
+        args.add_labels = prompt_yes_no("¿Agregar columnas descriptivas?", default=False)
+
+
 def main() -> None:
     args = parse_args()
+    if args.interactive or len(sys.argv) == 1:
+        data_input = prompt_value("Ruta del CSV principal", args.data)
+        args.data = data_input or args.data
     data_path = Path(args.data)
     if not data_path.exists():
         raise AnalysisError(f"No se encontró el archivo de datos: {data_path}")
 
     fieldnames, rows = read_csv_rows(data_path)
+    maybe_collect_interactive(args, fieldnames)
     if args.list_columns:
         print("Columnas disponibles:")
         for name in fieldnames:
