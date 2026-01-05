@@ -5,6 +5,7 @@ Ejemplos de uso:
   python analisis_rendicion.py --situacion-egreso 1 --region 6 --count-by CODIGO_COMUNA
   python analisis_rendicion.py --min-score CLEC_REG_ACTUAL=500 --min-score MATE1_REG_ACTUAL=500 \
       --output-csv filtrados.csv --add-labels
+  python analisis_rendicion.py --sort-by CODIGO_REGION:asc --sort-by PUNTAJE:desc --output-csv ordenados.csv
 """
 
 from __future__ import annotations
@@ -47,6 +48,12 @@ class CodeMaps:
     regiones: Dict[str, str]
     comunas: Dict[str, str]
     value_labels: Dict[str, Dict[str, str]]
+
+
+@dataclass(frozen=True)
+class SortKey:
+    column: str
+    descending: bool = False
 
 
 class AnalysisError(Exception):
@@ -127,6 +134,29 @@ def parse_score_filters(values: Sequence[str]) -> List[ScoreFilter]:
     return filters
 
 
+def parse_sort_by_args(values: Sequence[str], fieldnames: Sequence[str]) -> List[SortKey]:
+    sort_keys: List[SortKey] = []
+    for raw in values:
+        if not raw:
+            continue
+        column = raw
+        direction = "asc"
+        if ":" in raw:
+            column, direction = raw.split(":", 1)
+        column = column.strip()
+        direction = direction.strip().lower()
+        if not column:
+            raise AnalysisError(f"Orden inválido '{raw}'. Usa COLUMNA o COLUMNA:asc/desc.")
+        if column not in fieldnames:
+            raise AnalysisError(f"Columna inválida para ordenar: {column}")
+        if direction not in {"asc", "desc"}:
+            raise AnalysisError(
+                f"Dirección inválida '{direction}' en '{raw}'. Usa 'asc' o 'desc'."
+            )
+        sort_keys.append(SortKey(column=column, descending=direction == "desc"))
+    return sort_keys
+
+
 def to_float(value: str) -> Optional[float]:
     value = value.strip()
     if not value:
@@ -135,6 +165,29 @@ def to_float(value: str) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def sort_value(raw: str) -> Tuple[int, object]:
+    value = raw.strip()
+    if not value:
+        return (1, "")
+    try:
+        return (0, float(value))
+    except ValueError:
+        return (1, value.casefold())
+
+
+def sort_rows(rows: List[Dict[str, str]], sort_keys: Sequence[SortKey]) -> None:
+    for sort_key in reversed(sort_keys):
+        def key(row: Dict[str, str]) -> Tuple[bool, Tuple[int, object]]:
+            raw = row.get(sort_key.column, "")
+            is_empty = not raw.strip()
+            parsed = sort_value(raw)
+            if sort_key.descending:
+                return (not is_empty, parsed)
+            return (is_empty, parsed)
+
+        rows.sort(key=key, reverse=sort_key.descending)
 
 
 def load_cod_ens(path: Path) -> Dict[str, str]:
@@ -367,6 +420,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Columna por la que se quiere agrupar (se puede repetir).",
     )
+    parser.add_argument(
+        "--sort-by",
+        action="append",
+        default=[],
+        help="Ordena los datos por columna. Formato: COLUMNA o COLUMNA:asc/desc",
+    )
     parser.add_argument("--output-csv", help="Ruta de salida para filas filtradas.")
     parser.add_argument(
         "--add-labels",
@@ -481,6 +540,28 @@ def prompt_count_by(existing: List[str], fieldnames: List[str]) -> List[str]:
     return [item for item in requested if item in fieldnames]
 
 
+def prompt_sort_by(existing: List[str], fieldnames: List[str]) -> List[str]:
+    if existing:
+        return existing
+    raw = input(
+        "Columnas para ordenar (separadas por coma, usa :asc o :desc, Enter para omitir): "
+    ).strip()
+    if not raw:
+        return []
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    cleaned: List[str] = []
+    invalid: List[str] = []
+    for item in requested:
+        column = item.split(":", 1)[0].strip()
+        if column in fieldnames:
+            cleaned.append(item)
+        else:
+            invalid.append(item)
+    if invalid:
+        print(f"Orden inválido ignorado: {', '.join(invalid)}")
+    return cleaned
+
+
 def summarize_filters(
     column_filters: Dict[str, set[str]],
     min_scores: Dict[str, float],
@@ -592,6 +673,7 @@ def count_filtered_rows(
     column_filters: Dict[str, set[str]],
     min_scores: Dict[str, float],
     max_scores: Dict[str, float],
+    sort_keys: Sequence[SortKey],
 ) -> None:
     fieldnames, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
@@ -612,7 +694,14 @@ def count_filtered_rows(
         print("\nNo hay filas filtradas para mostrar.")
         return
 
-    print("\nFilas filtradas (ordenadas por el archivo):")
+    if sort_keys:
+        sort_rows(filtered_rows, sort_keys)
+
+    print(
+        "\nFilas filtradas (ordenadas por columna):"
+        if sort_keys
+        else "\nFilas filtradas (ordenadas por el archivo):"
+    )
     numbered, mapping = build_numbered_headers(fieldnames)
     headers = ["#"] + numbered
     rows_table = []
@@ -632,6 +721,7 @@ def manage_filters(
     initial_column_filters: Dict[str, set[str]],
     initial_min_scores: Dict[str, float],
     initial_max_scores: Dict[str, float],
+    sort_keys: Sequence[SortKey],
 ) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float]]:
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
@@ -729,7 +819,13 @@ def manage_filters(
                 min_scores.clear()
                 max_scores.clear()
         elif choice == "5":
-            count_filtered_rows(data_path, column_filters, min_scores, max_scores)
+            count_filtered_rows(
+                data_path,
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_keys,
+            )
         elif choice == "6":
             return column_filters, min_scores, max_scores
         elif choice == "7":
@@ -773,6 +869,9 @@ def collect_interactive_filters(
     min_scores = {f.column: f.threshold for f in parse_score_filters(args.min_score)}
     max_scores = {f.column: f.threshold for f in parse_score_filters(args.max_score)}
 
+    args.sort_by = prompt_sort_by(args.sort_by, fieldnames)
+    sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
+
     column_filters, min_scores, max_scores = manage_filters(
         fieldnames,
         data_path,
@@ -780,6 +879,7 @@ def collect_interactive_filters(
         initial_filters,
         min_scores,
         max_scores,
+        sort_keys,
     )
 
     args.count_by = prompt_count_by(args.count_by, fieldnames)
@@ -832,6 +932,7 @@ def main() -> None:
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
 
+    sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
 
     output_writer = None
@@ -852,19 +953,40 @@ def main() -> None:
     matched_rows = 0
 
     try:
-        for row in rows:
-            total_rows += 1
-            if not row_matches(row, column_filters, min_scores, max_scores):
-                continue
-            matched_rows += 1
-            enriched = add_label_columns(row, maps) if args.add_labels else row
+        if sort_keys:
+            filtered_rows: List[Dict[str, str]] = []
+            for row in rows:
+                total_rows += 1
+                if not row_matches(row, column_filters, min_scores, max_scores):
+                    continue
+                matched_rows += 1
+                enriched = add_label_columns(row, maps) if args.add_labels else row
+                filtered_rows.append(enriched)
+            if filtered_rows:
+                sort_rows(filtered_rows, sort_keys)
             if output_writer:
-                output_writer.writerow({key: enriched.get(key, "") for key in output_fields})
-            for column in counts:
-                value = normalize_code(enriched.get(column, ""))
-                if args.add_labels:
-                    value = label_value(column, value, maps)
-                counts[column][value] += 1
+                for row in filtered_rows:
+                    output_writer.writerow({key: row.get(key, "") for key in output_fields})
+            for row in filtered_rows:
+                for column in counts:
+                    value = normalize_code(row.get(column, ""))
+                    if args.add_labels:
+                        value = label_value(column, value, maps)
+                    counts[column][value] += 1
+        else:
+            for row in rows:
+                total_rows += 1
+                if not row_matches(row, column_filters, min_scores, max_scores):
+                    continue
+                matched_rows += 1
+                enriched = add_label_columns(row, maps) if args.add_labels else row
+                if output_writer:
+                    output_writer.writerow({key: enriched.get(key, "") for key in output_fields})
+                for column in counts:
+                    value = normalize_code(enriched.get(column, ""))
+                    if args.add_labels:
+                        value = label_value(column, value, maps)
+                    counts[column][value] += 1
     finally:
         if output_handle:
             output_handle.close()
