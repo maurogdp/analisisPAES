@@ -1,14 +1,71 @@
+import fnmatch
+import os
+
 import pandas as pd
 import pyperclip
 from tabulate import tabulate
 
+PATRONES_PONDERACIONES = [
+    "Libro_CódigosADM*_ArchivoD_Anexo -  Oferta académica_corregido.csv",
+    "Libro_CódigosADM*_ArchivoD_Anexo - Oferta académica_corregido.csv",
+]
+PATRONES_RENDICION = [
+    "ArchivoC_Adm*_corregido_final.csv",
+]
+
+def buscar_archivos(base_dir, patrones):
+    coincidencias = []
+    for root, _, files in os.walk(base_dir):
+        for pattern in patrones:
+            for filename in fnmatch.filter(files, pattern):
+                coincidencias.append(os.path.join(root, filename))
+    return sorted(set(coincidencias))
+
+def seleccionar_archivo_desde_lista(archivos, titulo):
+    if not archivos:
+        return None
+
+    print(f"\nArchivos disponibles para {titulo}:")
+    for idx, path in enumerate(archivos, start=1):
+        print(f"{idx}. {os.path.relpath(path, os.getcwd())}")
+    print("0. Ingresar ruta manual")
+
+    while True:
+        seleccion = input("Seleccione un número: ").strip()
+        if seleccion == "0":
+            return None
+        if seleccion.isdigit():
+            indice = int(seleccion) - 1
+            if 0 <= indice < len(archivos):
+                return archivos[indice]
+        print("Selección no válida. Intente nuevamente.")
+
+def seleccionar_archivo_csv(titulo, patrones):
+    archivos = buscar_archivos(os.getcwd(), patrones)
+    archivo = seleccionar_archivo_desde_lista(archivos, titulo)
+    if archivo:
+        print(f"Usando archivo: {archivo}")
+        return archivo
+
+    return input(f"\nIngrese la ruta del archivo para {titulo}: ").strip()
+
 # --------------------------
 # Funciones de ponderación (MODIFICADAS para nueva estructura)
 # --------------------------
-def cargar_ponderaciones():
+def cargar_ponderaciones(archivo_ponderaciones=None):
     """Carga el archivo con las ponderaciones de carreras"""
+    if not archivo_ponderaciones:
+        archivo_ponderaciones = seleccionar_archivo_csv(
+            "ponderaciones",
+            PATRONES_PONDERACIONES
+        )
+
+    if not archivo_ponderaciones:
+        print("No se seleccionó un archivo de ponderaciones.")
+        return None
+
     try:
-        return pd.read_csv("analisis PAES\\PROCESO-DE-ADMISIÓN-2025-POSTULACIÓN-19-01-2025T23-38-41 (2)\\PostulaciónySelección_Admisión2025\\Libro_CódigosADM2025_ArchivoD_Anexo -  Oferta académica_corregido.csv", encoding='utf-8')
+        return pd.read_csv(archivo_ponderaciones, encoding='utf-8')
     except Exception as e:
         print(f"Error al cargar ponderaciones: {e}")
         return None
@@ -347,13 +404,10 @@ def buscar_ids_en_csv():
         print(f"\nIDs encontrados en portapapeles ({len(ids)}):")
         print('\n'.join(ids[:5]) + ('\n...' if len(ids) > 5 else ''))
         
-        # Preguntar si se desea usar el archivo de postulaciones por defecto
-        usar_por_defecto = input("\n¿Desea utilizar el archivo de postulaciones por defecto? (s/n): ").strip().lower()
-        if usar_por_defecto == 's':
-            archivo_csv = "analisis PAES\\PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20\\Rinden_Admisión2025\\ArchivoC_Adm2025_corregido_final.csv"
-            print(f"Usando archivo por defecto: {archivo_csv}")
-        else:
-            archivo_csv = input("\nIngrese la ruta del archivo CSV de postulaciones: ")
+        archivo_csv = seleccionar_archivo_csv(
+            "postulaciones/rendición",
+            PATRONES_RENDICION
+        )
 
 
         # # Solicitar archivo CSV
@@ -376,7 +430,11 @@ def buscar_ids_en_csv():
                 resultados_procesados = procesar_dataframe(resultados)
                 
                 # --- Cálculo de ponderación ---
-                df_ponderaciones = cargar_ponderaciones()
+                archivo_ponderaciones = seleccionar_archivo_csv(
+                    "ponderaciones",
+                    PATRONES_PONDERACIONES
+                )
+                df_ponderaciones = cargar_ponderaciones(archivo_ponderaciones)
 
                 if df_ponderaciones is not None:
                     print("\nAhora seleccione universidad y carrera para calcular ponderación:")

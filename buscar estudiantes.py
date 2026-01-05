@@ -1,13 +1,62 @@
+import fnmatch
+import os
+
 import pandas as pd
 from tabulate import tabulate
 
-# Configuración inicial
-UNIVERSIDADES_CSV = "analisis PAES\\PROCESO-DE-ADMISIÓN-2025-POSTULACIÓN-19-01-2025T23-38-41 (2)\\PostulaciónySelección_Admisión2025\\Libro_CódigosADM2025_ArchivoD_Anexo -  Oferta académica_corregido.csv"  # Asegúrate de tener este archivo en el mismo directorio
+PATRONES_UNIVERSIDADES = [
+    "Libro_CódigosADM*_ArchivoD_Anexo -  Oferta académica_corregido.csv",
+    "Libro_CódigosADM*_ArchivoD_Anexo - Oferta académica_corregido.csv",
+]
+
+def buscar_archivos(base_dir, patrones):
+    coincidencias = []
+    for root, _, files in os.walk(base_dir):
+        for pattern in patrones:
+            for filename in fnmatch.filter(files, pattern):
+                coincidencias.append(os.path.join(root, filename))
+    return sorted(set(coincidencias))
+
+def seleccionar_archivo_desde_lista(archivos, titulo):
+    if not archivos:
+        return None
+
+    print(f"\nArchivos disponibles para {titulo}:")
+    for idx, path in enumerate(archivos, start=1):
+        print(f"{idx}. {os.path.relpath(path, os.getcwd())}")
+    print("0. Ingresar ruta manual")
+
+    while True:
+        seleccion = input("Seleccione un número: ").strip()
+        if seleccion == "0":
+            return None
+        if seleccion.isdigit():
+            indice = int(seleccion) - 1
+            if 0 <= indice < len(archivos):
+                return archivos[indice]
+        print("Selección no válida. Intente nuevamente.")
+
+def seleccionar_archivo_csv(titulo, patrones):
+    archivos = buscar_archivos(os.getcwd(), patrones)
+    archivo = seleccionar_archivo_desde_lista(archivos, titulo)
+    if archivo:
+        print(f"Usando archivo: {archivo}")
+        return archivo
+
+    return input(f"\nIngrese la ruta del archivo para {titulo}: ").strip()
 
 def cargar_datos_universidades():
     """Carga el archivo CSV con información de universidades y carreras"""
+    archivo_universidades = seleccionar_archivo_csv(
+        "universidades y carreras",
+        PATRONES_UNIVERSIDADES
+    )
+    if not archivo_universidades:
+        print("No se seleccionó un archivo de universidades.")
+        return None
+
     try:
-        return pd.read_csv(UNIVERSIDADES_CSV)
+        return pd.read_csv(archivo_universidades)
     except Exception as e:
         print(f"Error al cargar el archivo de universidades: {e}")
         return None

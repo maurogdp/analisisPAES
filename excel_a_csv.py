@@ -1,27 +1,62 @@
+import fnmatch
 import os
+
 import pandas as pd
 from tkinter import Tk, filedialog
+
+def buscar_archivos(base_dir, patrones):
+    coincidencias = []
+    for root, _, files in os.walk(base_dir):
+        for pattern in patrones:
+            for filename in fnmatch.filter(files, pattern):
+                coincidencias.append(os.path.join(root, filename))
+    return sorted(set(coincidencias))
+
+def seleccionar_archivo_desde_lista(archivos, titulo):
+    if not archivos:
+        return None
+
+    print(f"\nArchivos disponibles para {titulo}:")
+    for idx, path in enumerate(archivos, start=1):
+        print(f"{idx}. {os.path.relpath(path, os.getcwd())}")
+    print("0. Abrir selector de archivos")
+
+    while True:
+        seleccion = input("Seleccione un número: ").strip()
+        if seleccion == "0":
+            return None
+        if seleccion.isdigit():
+            indice = int(seleccion) - 1
+            if 0 <= indice < len(archivos):
+                return archivos[indice]
+        print("Selección no válida. Intente nuevamente.")
 
 def select_excel_and_convert_to_csv():
     """
     Navega hasta 2 niveles hacia atrás desde la carpeta actual para seleccionar un archivo Excel,
     luego convierte cada hoja a CSV en la carpeta del archivo original.
     """
-    # Configurar la ventana de diálogo (oculta)
-    root = Tk()
-    root.withdraw()
-    
     # Obtener la carpeta actual y posibles carpetas padre
     current_dir = os.getcwd()
     parent_dir = os.path.dirname(current_dir)
     grandparent_dir = os.path.dirname(parent_dir)
+
+    archivos_encontrados = buscar_archivos(current_dir, ["*.xlsx", "*.xls"])
+    file_path = seleccionar_archivo_desde_lista(
+        archivos_encontrados,
+        "Excel disponibles"
+    )
     
     # Intentar seleccionar archivo empezando desde la carpeta actual
-    file_path = filedialog.askopenfilename(
-        initialdir=current_dir,
-        title="Seleccione archivo Excel",
-        filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
-    )
+    if not file_path:
+        # Configurar la ventana de diálogo (oculta)
+        root = Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(
+            initialdir=current_dir,
+            title="Seleccione archivo Excel",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")]
+        )
     
     # Si no se seleccionó en la carpeta actual, intentar en carpetas padre
     if not file_path:
