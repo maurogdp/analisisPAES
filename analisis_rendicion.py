@@ -219,12 +219,62 @@ def add_label_columns(row: Dict[str, str], maps: CodeMaps) -> Dict[str, str]:
     return enriched
 
 
+def abbreviate_headers(
+    headers: Sequence[str],
+    max_length: int = 18,
+) -> Tuple[List[str], List[Tuple[str, str]]]:
+    abbreviated: List[str] = []
+    changes: List[Tuple[str, str]] = []
+    used: set[str] = set()
+    for header in headers:
+        candidate = header
+        if len(candidate) > max_length:
+            parts = [part[:3] for part in header.split("_") if part]
+            candidate = "_".join(parts) or header[:max_length]
+        if len(candidate) > max_length:
+            candidate = f"{candidate[: max_length - 1]}…"
+        base = candidate
+        counter = 2
+        while candidate in used:
+            suffix = f"_{counter}"
+            trimmed = base[: max_length - len(suffix)]
+            candidate = f"{trimmed}{suffix}"
+            counter += 1
+        used.add(candidate)
+        abbreviated.append(candidate)
+        if candidate != header:
+            changes.append((candidate, header))
+    return abbreviated, changes
+
+
+def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
+    widths = [len(header) for header in headers]
+    normalized_rows = []
+    for row in rows:
+        normalized = [str(cell) for cell in row]
+        normalized_rows.append(normalized)
+        for idx, cell in enumerate(normalized):
+            widths[idx] = max(widths[idx], len(cell))
+
+    header_line = " | ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers))
+    separator = "-+-".join("-" * width for width in widths)
+    print(header_line)
+    print(separator)
+    for row in normalized_rows:
+        print(" | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row)))
+
+
 def print_counts(counts: Dict[str, Counter]) -> None:
     for column, counter in counts.items():
         print(f"\nRecuento por {column}:")
+        rows = []
         for key, value in counter.most_common():
             label = key if key else "(vacío)"
-            print(f"  {label}: {value}")
+            rows.append([label, str(value)])
+        if not rows:
+            print("(sin datos)")
+            continue
+        print_table(["Valor", "Cantidad"], rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -456,11 +506,13 @@ def count_filtered_rows(
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     total_rows = 0
     matched_rows = 0
+    filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         if not row_matches(row, column_filters, min_list, max_list):
             continue
         matched_rows += 1
+        filtered_rows.append(row)
     print("\nResumen con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
@@ -469,15 +521,16 @@ def count_filtered_rows(
         return
 
     print("\nFilas filtradas (ordenadas por el archivo):")
-    _, rows = read_csv_rows(data_path)
-    row_index = 0
-    for row in rows:
-        if not row_matches(row, column_filters, min_list, max_list):
-            continue
-        row_index += 1
-        print(f"\nFila {row_index}:")
-        for col in fieldnames:
-            print(f"  - {col}: {row.get(col, '')}")
+    abbreviated, changes = abbreviate_headers(fieldnames)
+    headers = ["#"] + abbreviated
+    rows_table = []
+    for index, row in enumerate(filtered_rows, start=1):
+        rows_table.append([str(index)] + [row.get(col, "") for col in fieldnames])
+    print_table(headers, rows_table)
+    if changes:
+        print("\nAbreviaciones de encabezados:")
+        for short, original in changes:
+            print(f"- {short} = {original}")
 
 
 def manage_filters(
