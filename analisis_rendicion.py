@@ -721,23 +721,28 @@ def manage_filters(
     initial_column_filters: Dict[str, set[str]],
     initial_min_scores: Dict[str, float],
     initial_max_scores: Dict[str, float],
-    sort_keys: Sequence[SortKey],
-) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float]]:
+    initial_sort_by: List[str],
+    sort_keys: List[SortKey],
+) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float], List[str], List[SortKey]]:
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
     max_scores = dict(initial_max_scores)
+    sort_by = list(initial_sort_by)
     value_cache: Dict[str, Counter] = {}
     while True:
         summarize_filters(column_filters, min_scores, max_scores)
+        if sort_by:
+            print(f"- Orden actual: {', '.join(sort_by)}")
         print(
             "\n¿Qué deseas hacer ahora?\n"
             "1. Agregar filtro\n"
             "2. Modificar filtro\n"
             "3. Eliminar filtro\n"
             "4. Reiniciar filtros\n"
-            "5. Mostrar datos actuales\n"
-            "6. Continuar\n"
-            "7. Terminar programa"
+            "5. Ordenar datos\n"
+            "6. Mostrar datos actuales\n"
+            "7. Continuar\n"
+            "8. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -819,6 +824,13 @@ def manage_filters(
                 min_scores.clear()
                 max_scores.clear()
         elif choice == "5":
+            sort_by = prompt_sort_by([], fieldnames)
+            sort_keys = parse_sort_by_args(sort_by, fieldnames)
+            if sort_by:
+                print(f"Orden aplicado: {', '.join(sort_by)}")
+            else:
+                print("Orden limpiado; se usará el orden del archivo.")
+        elif choice == "6":
             count_filtered_rows(
                 data_path,
                 column_filters,
@@ -826,9 +838,9 @@ def manage_filters(
                 max_scores,
                 sort_keys,
             )
-        elif choice == "6":
-            return column_filters, min_scores, max_scores
         elif choice == "7":
+            return column_filters, min_scores, max_scores, sort_by, sort_keys
+        elif choice == "8":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -840,7 +852,7 @@ def collect_interactive_filters(
     fieldnames: List[str],
     data_path: Path,
     maps: CodeMaps,
-) -> Tuple[Dict[str, set[str]], List[ScoreFilter], List[ScoreFilter]]:
+) -> Tuple[Dict[str, set[str]], List[ScoreFilter], List[ScoreFilter], List[SortKey]]:
     print("=== Modo interactivo: análisis de rendición ===")
 
     if prompt_yes_no("¿Deseas ver las columnas disponibles?", default=False):
@@ -872,13 +884,14 @@ def collect_interactive_filters(
     args.sort_by = prompt_sort_by(args.sort_by, fieldnames)
     sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
 
-    column_filters, min_scores, max_scores = manage_filters(
+    column_filters, min_scores, max_scores, args.sort_by, sort_keys = manage_filters(
         fieldnames,
         data_path,
         maps,
         initial_filters,
         min_scores,
         max_scores,
+        args.sort_by,
         sort_keys,
     )
 
@@ -892,7 +905,7 @@ def collect_interactive_filters(
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
-    return column_filters, min_list, max_list
+    return column_filters, min_list, max_list, sort_keys
 
 
 def main() -> None:
@@ -916,7 +929,7 @@ def main() -> None:
     )
 
     if args.interactive or len(sys.argv) == 1:
-        column_filters, min_scores, max_scores = collect_interactive_filters(
+        column_filters, min_scores, max_scores, sort_keys = collect_interactive_filters(
             args, fieldnames, data_path, maps
         )
     else:
@@ -931,8 +944,7 @@ def main() -> None:
         }
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
-
-    sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
+        sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
 
     output_writer = None
