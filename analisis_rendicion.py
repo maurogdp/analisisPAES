@@ -29,6 +29,10 @@ DEFAULT_COMUNAS = (
     "PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20/"
     "Rinden_Admisión2025/Libro_CódigosADM2025_ArchivoC_Anexo - ComunasRegiones.csv"
 )
+DEFAULT_CODEBOOK = (
+    "PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20/"
+    "Rinden_Admisión2025/Libro_CódigosADM2025_ArchivoC_Rinden.csv"
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,7 @@ class CodeMaps:
     cod_ens: Dict[str, str]
     regiones: Dict[str, str]
     comunas: Dict[str, str]
+    value_labels: Dict[str, Dict[str, str]]
 
 
 class AnalysisError(Exception):
@@ -167,10 +172,52 @@ def load_comunas_regiones(path: Path) -> Tuple[Dict[str, str], Dict[str, str]]:
         return regiones, comunas
 
 
-def build_code_maps(cod_ens_path: Path, comunas_path: Path) -> CodeMaps:
+def load_codebook(path: Path) -> Dict[str, Dict[str, str]]:
+    if not path.exists():
+        return {}
+    dialect = sniff_dialect(path)
+    mappings: Dict[str, Dict[str, str]] = {}
+    current_variable = ""
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, dialect=dialect)
+        for row in reader:
+            variable = normalize_code(row.get("Variable"))
+            detail = normalize_code(row.get("Detalle"))
+            if variable:
+                current_variable = variable
+                continue
+            if not current_variable or not detail:
+                continue
+            code = ""
+            description = ""
+            if "." in detail:
+                code, description = detail.split(".", 1)
+            elif ":" in detail:
+                code, description = detail.split(":", 1)
+            if not code or not description:
+                continue
+            code = code.strip()
+            description = description.strip()
+            if not code or not description:
+                continue
+            mappings.setdefault(current_variable, {})[code] = description
+    return mappings
+
+
+def build_code_maps(
+    cod_ens_path: Path,
+    comunas_path: Path,
+    codebook_path: Path,
+) -> CodeMaps:
     cod_ens = load_cod_ens(cod_ens_path)
     regiones, comunas = load_comunas_regiones(comunas_path)
-    return CodeMaps(cod_ens=cod_ens, regiones=regiones, comunas=comunas)
+    value_labels = load_codebook(codebook_path)
+    return CodeMaps(
+        cod_ens=cod_ens,
+        regiones=regiones,
+        comunas=comunas,
+        value_labels=value_labels,
+    )
 
 
 def row_matches(
@@ -195,11 +242,22 @@ def row_matches(
     return True
 
 
-def label_value(column: str, value: str, maps: CodeMaps) -> str:
+def value_description(column: str, value: str, maps: CodeMaps) -> str:
+    if column in maps.value_labels and value in maps.value_labels[column]:
+        return maps.value_labels[column][value]
     if column == "COD_ENS" and value in maps.cod_ens:
-        return f"{value} - {maps.cod_ens[value]}"
+        return maps.cod_ens[value]
     if column == "CODIGO_REGION" and value in maps.regiones:
-        return f"{value} - {maps.regiones[value]}"
+        return maps.regiones[value]
+    if column == "CODIGO_COMUNA" and value in maps.comunas:
+        return maps.comunas[value]
+    return ""
+
+
+def label_value(column: str, value: str, maps: CodeMaps) -> str:
+    description = value_description(column, value, maps)
+    if description:
+        return f"{value} - {description}"
     return value
 
 
@@ -278,6 +336,11 @@ def parse_args() -> argparse.Namespace:
         "--comunas-csv",
         default=DEFAULT_COMUNAS,
         help="CSV auxiliar con regiones y comunas.",
+    )
+    parser.add_argument(
+        "--codebook-csv",
+        default=DEFAULT_CODEBOOK,
+        help="CSV con códigos y descripciones de variables.",
     )
     parser.add_argument("--rbd", help="Lista de RBD separados por coma.")
     parser.add_argument("--situacion-egreso", help="Lista de situación de egreso.")
@@ -457,7 +520,54 @@ def prompt_column(fieldnames: List[str]) -> str:
     return fieldnames[selection - 1]
 
 
-def prompt_column_value(column: str) -> set[str]:
+def collect_column_values(
+    column: str,
+    data_path: Path,
+    cache: Dict[str, Counter],
+) -> Counter:
+    if column in cache:
+        return cache[column]
+    _, rows = read_csv_rows(data_path)
+    counts: Counter = Counter()
+    for row in rows:
+        value = normalize_code(row.get(column))
+        counts[value] += 1
+    cache[column] = counts
+    return counts
+
+
+def print_column_value_help(
+    column: str,
+    data_path: Path,
+    maps: CodeMaps,
+    cache: Dict[str, Counter],
+) -> None:
+    counts = collect_column_values(column, data_path, cache)
+    if not counts:
+        print(f"\nNo se encontraron valores para {column}.")
+        return
+    rows = []
+    for value in sorted(counts.keys()):
+        description = value_description(column, value, maps)
+        rows.append(
+            [
+                value or "(vacío)",
+                description or "(sin descripción)",
+                str(counts[value]),
+            ]
+        )
+    print(f"\nValores disponibles para {column}:")
+    print_table(["Valor", "Descripción", "Cantidad"], rows)
+
+
+def prompt_column_value(
+    column: str,
+    data_path: Path,
+    maps: CodeMaps,
+    cache: Dict[str, Counter],
+) -> set[str]:
+    if column in maps.value_labels or column in {"COD_ENS", "CODIGO_REGION", "CODIGO_COMUNA"}:
+        print_column_value_help(column, data_path, maps, cache)
     raw = input(
         f"Valores para {column} (separados por coma, Enter para cancelar): "
     ).strip()
@@ -518,6 +628,7 @@ def count_filtered_rows(
 def manage_filters(
     fieldnames: List[str],
     data_path: Path,
+    maps: CodeMaps,
     initial_column_filters: Dict[str, set[str]],
     initial_min_scores: Dict[str, float],
     initial_max_scores: Dict[str, float],
@@ -525,6 +636,7 @@ def manage_filters(
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
     max_scores = dict(initial_max_scores)
+    value_cache: Dict[str, Counter] = {}
     while True:
         summarize_filters(column_filters, min_scores, max_scores)
         print(
@@ -534,7 +646,8 @@ def manage_filters(
             "3. Eliminar filtro\n"
             "4. Reiniciar filtros\n"
             "5. Mostrar datos actuales\n"
-            "6. Continuar"
+            "6. Continuar\n"
+            "7. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -545,7 +658,7 @@ def manage_filters(
             filter_type = input("Selecciona el tipo: ").strip()
             if filter_type == "1":
                 column = prompt_column(fieldnames)
-                values = prompt_column_value(column)
+                values = prompt_column_value(column, data_path, maps, value_cache)
                 if values:
                     column_filters[column] = values
             elif filter_type == "2":
@@ -577,7 +690,7 @@ def manage_filters(
             selection = prompt_choice("Selecciona el filtro a modificar:", options)
             kind, column = index[selection - 1]
             if kind == "igual":
-                values = prompt_column_value(column)
+                values = prompt_column_value(column, data_path, maps, value_cache)
                 if values:
                     column_filters[column] = values
             elif kind == "min":
@@ -619,6 +732,9 @@ def manage_filters(
             count_filtered_rows(data_path, column_filters, min_scores, max_scores)
         elif choice == "6":
             return column_filters, min_scores, max_scores
+        elif choice == "7":
+            print("Programa terminado por el usuario.")
+            raise SystemExit(0)
         else:
             print("Opción inválida.")
 
@@ -627,6 +743,7 @@ def collect_interactive_filters(
     args: argparse.Namespace,
     fieldnames: List[str],
     data_path: Path,
+    maps: CodeMaps,
 ) -> Tuple[Dict[str, set[str]], List[ScoreFilter], List[ScoreFilter]]:
     print("=== Modo interactivo: análisis de rendición ===")
 
@@ -659,6 +776,7 @@ def collect_interactive_filters(
     column_filters, min_scores, max_scores = manage_filters(
         fieldnames,
         data_path,
+        maps,
         initial_filters,
         min_scores,
         max_scores,
@@ -691,9 +809,15 @@ def main() -> None:
         print_column_index(fieldnames)
         return
 
+    maps = build_code_maps(
+        Path(args.cod_ens_csv),
+        Path(args.comunas_csv),
+        Path(args.codebook_csv),
+    )
+
     if args.interactive or len(sys.argv) == 1:
         column_filters, min_scores, max_scores = collect_interactive_filters(
-            args, fieldnames, data_path
+            args, fieldnames, data_path, maps
         )
     else:
         column_filters = {
@@ -707,8 +831,6 @@ def main() -> None:
         }
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
-
-    maps = build_code_maps(Path(args.cod_ens_csv), Path(args.comunas_csv))
 
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
 
