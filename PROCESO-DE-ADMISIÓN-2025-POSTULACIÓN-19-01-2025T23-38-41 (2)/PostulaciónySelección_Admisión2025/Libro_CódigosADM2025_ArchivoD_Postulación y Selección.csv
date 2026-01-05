@@ -1,0 +1,11 @@
+Variable,Detalle
+ID_aux,Identificador único del postulante
+ORDEN_PREF,"Indica la preferencia del postulante, puede tomar valores entre 1 y 20"
+COD_CARRERA_PREF,Código de la carrera en la preferencia
+ESTADO_PREF,Estado de situación en la preferencia
+TIPO_PREF,Tipo de preferencia 
+,REGULAR
+,BEA
+,PACE
+,GENERO
+PTJE_PREF,Puntaje ponderado en la preferencia
