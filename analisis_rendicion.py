@@ -217,32 +217,10 @@ def add_label_columns(row: Dict[str, str], maps: CodeMaps) -> Dict[str, str]:
     return enriched
 
 
-def abbreviate_headers(
-    headers: Sequence[str],
-    max_length: int = 18,
-) -> Tuple[List[str], List[Tuple[str, str]]]:
-    abbreviated: List[str] = []
-    changes: List[Tuple[str, str]] = []
-    used: set[str] = set()
-    for header in headers:
-        candidate = header
-        if len(candidate) > max_length:
-            parts = [part[:3] for part in header.split("_") if part]
-            candidate = "_".join(parts) or header[:max_length]
-        if len(candidate) > max_length:
-            candidate = f"{candidate[: max_length - 1]}…"
-        base = candidate
-        counter = 2
-        while candidate in used:
-            suffix = f"_{counter}"
-            trimmed = base[: max_length - len(suffix)]
-            candidate = f"{trimmed}{suffix}"
-            counter += 1
-        used.add(candidate)
-        abbreviated.append(candidate)
-        if candidate != header:
-            changes.append((candidate, header))
-    return abbreviated, changes
+def build_numbered_headers(headers: Sequence[str]) -> Tuple[List[str], List[Tuple[str, str]]]:
+    numbered = [str(idx) for idx, _ in enumerate(headers, start=1)]
+    mapping = [(str(idx), header) for idx, header in enumerate(headers, start=1)]
+    return numbered, mapping
 
 
 def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
@@ -260,6 +238,12 @@ def print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
     print(separator)
     for row in normalized_rows:
         print(" | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row)))
+
+
+def print_column_index(headers: Sequence[str]) -> None:
+    print("\nÍndice de columnas:")
+    for idx, header in enumerate(headers, start=1):
+        print(f"- {idx}: {header}")
 
 
 def print_counts(counts: Dict[str, Counter]) -> None:
@@ -519,15 +503,15 @@ def count_filtered_rows(
         return
 
     print("\nFilas filtradas (ordenadas por el archivo):")
-    abbreviated, changes = abbreviate_headers(fieldnames)
-    headers = ["#"] + abbreviated
+    numbered, mapping = build_numbered_headers(fieldnames)
+    headers = ["#"] + numbered
     rows_table = []
     for index, row in enumerate(filtered_rows, start=1):
         rows_table.append([str(index)] + [row.get(col, "") for col in fieldnames])
     print_table(headers, rows_table)
-    if changes:
-        print("\nAbreviaciones de encabezados:")
-        for short, original in changes:
+    if mapping:
+        print("\nEncabezados numéricos:")
+        for short, original in mapping:
             print(f"- {short} = {original}")
 
 
@@ -647,9 +631,7 @@ def collect_interactive_filters(
     print("=== Modo interactivo: análisis de rendición ===")
 
     if prompt_yes_no("¿Deseas ver las columnas disponibles?", default=False):
-        print("\nColumnas disponibles:")
-        for name in fieldnames:
-            print(f"- {name}")
+        print_column_index(fieldnames)
 
     initial_filters = {}
     if args.rbd:
@@ -706,8 +688,7 @@ def main() -> None:
     fieldnames, rows = read_csv_rows(data_path)
     if args.list_columns:
         print("Columnas disponibles:")
-        for name in fieldnames:
-            print(f"- {name}")
+        print_column_index(fieldnames)
         return
 
     if args.interactive or len(sys.argv) == 1:
