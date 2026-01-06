@@ -811,6 +811,48 @@ def count_filtered_rows(
             print(f"- {short} = {original}")
 
 
+def show_filtered_statistics(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    default_percentiles: str,
+) -> None:
+    stats_columns = prompt_stats_columns([], fieldnames)
+    if not stats_columns:
+        print("No se seleccionaron columnas para estadísticas.")
+        return
+    percentiles_raw = default_percentiles
+    if prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
+        percentiles_raw = prompt_value(
+            "Percentiles (separados por coma)", default_percentiles
+        )
+    percentiles = parse_percentiles(percentiles_raw)
+
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    stats_values: Dict[str, List[float]] = {column: [] for column in stats_columns}
+
+    fieldnames, rows = read_csv_rows(data_path)
+    total_rows = 0
+    matched_rows = 0
+    for row in rows:
+        total_rows += 1
+        if not row_matches(row, column_filters, min_list, max_list):
+            continue
+        matched_rows += 1
+        for column in stats_values:
+            value = to_float(row.get(column, ""))
+            if value is not None:
+                stats_values[column].append(value)
+
+    print("\nResumen estadístico con filtros actuales:")
+    print(f"- Total de registros: {total_rows}")
+    print(f"- Registros filtrados: {matched_rows}")
+    print_statistics(stats_values, percentiles)
+
+
 def manage_filters(
     fieldnames: List[str],
     data_path: Path,
@@ -820,6 +862,7 @@ def manage_filters(
     initial_max_scores: Dict[str, float],
     initial_sort_by: List[str],
     sort_keys: List[SortKey],
+    default_percentiles: str,
 ) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float], List[str], List[SortKey]]:
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
@@ -838,8 +881,9 @@ def manage_filters(
             "4. Reiniciar filtros\n"
             "5. Ordenar datos\n"
             "6. Mostrar datos actuales\n"
-            "7. Continuar\n"
-            "8. Terminar programa"
+            "7. Ver estadísticos\n"
+            "8. Continuar\n"
+            "9. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -936,8 +980,17 @@ def manage_filters(
                 sort_keys,
             )
         elif choice == "7":
-            return column_filters, min_scores, max_scores, sort_by, sort_keys
+            show_filtered_statistics(
+                data_path,
+                fieldnames,
+                column_filters,
+                min_scores,
+                max_scores,
+                default_percentiles,
+            )
         elif choice == "8":
+            return column_filters, min_scores, max_scores, sort_by, sort_keys
+        elif choice == "9":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -990,6 +1043,7 @@ def collect_interactive_filters(
         max_scores,
         args.sort_by,
         sort_keys,
+        args.percentiles,
     )
 
     args.count_by = prompt_count_by(args.count_by, fieldnames)
