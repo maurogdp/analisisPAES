@@ -5,6 +5,8 @@ Ejemplos de uso:
   python analisis_rendicion.py --situacion-egreso 1 --region 6 --count-by CODIGO_COMUNA
   python analisis_rendicion.py --min-score CLEC_REG_ACTUAL=500 --min-score MATE1_REG_ACTUAL=500 \
       --output-csv filtrados.csv --add-labels
+  python analisis_rendicion.py --region 6 --stats CLEC_REG_ACTUAL --stats MATE1_REG_ACTUAL \
+      --percentiles 25,50,75
   python analisis_rendicion.py --sort-by CODIGO_REGION:asc --sort-by PUNTAJE:desc --output-csv ordenados.csv
 """
 
@@ -16,6 +18,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import mean, median, pstdev
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_DATA = (
@@ -155,6 +158,24 @@ def parse_sort_by_args(values: Sequence[str], fieldnames: Sequence[str]) -> List
             )
         sort_keys.append(SortKey(column=column, descending=direction == "desc"))
     return sort_keys
+
+
+def parse_percentiles(raw: Optional[str]) -> List[float]:
+    if not raw:
+        return []
+    values = []
+    for item in raw.split(","):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        try:
+            value = float(cleaned)
+        except ValueError as exc:
+            raise AnalysisError(f"Percentil inválido '{cleaned}'.") from exc
+        if not 0 <= value <= 100:
+            raise AnalysisError(f"Percentil fuera de rango: {value}. Usa 0-100.")
+        values.append(value)
+    return sorted(set(values))
 
 
 def to_float(value: str) -> Optional[float]:
@@ -370,6 +391,56 @@ def print_counts(counts: Dict[str, Counter]) -> None:
         print_table(["Valor", "Cantidad"], rows)
 
 
+def percentile(sorted_values: List[float], percent: float) -> Optional[float]:
+    if not sorted_values:
+        return None
+    if percent <= 0:
+        return sorted_values[0]
+    if percent >= 100:
+        return sorted_values[-1]
+    position = (len(sorted_values) - 1) * (percent / 100)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    fraction = position - lower_index
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    return lower_value + (upper_value - lower_value) * fraction
+
+
+def print_statistics(
+    stats: Dict[str, List[float]],
+    percentiles: Sequence[float],
+) -> None:
+    if not stats:
+        return
+    print("\nEstadísticas de columnas (filtradas):")
+    base_headers = ["Columna", "N", "Promedio", "Mediana", "Desv. Est."]
+    percentile_headers = [f"P{int(p)}" if p.is_integer() else f"P{p}" for p in percentiles]
+    headers = base_headers + percentile_headers
+    rows = []
+    for column, values in stats.items():
+        cleaned = [value for value in values if value is not None]
+        if not cleaned:
+            rows.append([column, "0", "-", "-", "-"] + ["-" for _ in percentiles])
+            continue
+        ordered = sorted(cleaned)
+        avg = mean(ordered)
+        med = median(ordered)
+        deviation = pstdev(ordered) if len(ordered) > 1 else 0.0
+        row = [
+            column,
+            str(len(ordered)),
+            f"{avg:.2f}",
+            f"{med:.2f}",
+            f"{deviation:.2f}",
+        ]
+        for perc in percentiles:
+            value = percentile(ordered, perc)
+            row.append(f"{value:.2f}" if value is not None else "-")
+        rows.append(row)
+    print_table(headers, rows)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analiza archivos de rendición con filtros y recuentos.",
@@ -419,6 +490,17 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Columna por la que se quiere agrupar (se puede repetir).",
+    )
+    parser.add_argument(
+        "--stats",
+        action="append",
+        default=[],
+        help="Columna numérica para calcular estadísticas (se puede repetir).",
+    )
+    parser.add_argument(
+        "--percentiles",
+        default="25,50,75",
+        help="Percentiles a calcular para --stats (separados por coma).",
     )
     parser.add_argument(
         "--sort-by",
@@ -530,6 +612,21 @@ def prompt_count_by(existing: List[str], fieldnames: List[str]) -> List[str]:
         return existing
     raw = input(
         "Columnas para agrupar (separadas por coma, Enter para omitir): "
+    ).strip()
+    if not raw:
+        return []
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    invalid = [item for item in requested if item not in fieldnames]
+    if invalid:
+        print(f"Columnas inválidas ignoradas: {', '.join(invalid)}")
+    return [item for item in requested if item in fieldnames]
+
+
+def prompt_stats_columns(existing: List[str], fieldnames: List[str]) -> List[str]:
+    if existing:
+        return existing
+    raw = input(
+        "Columnas numéricas para estadísticas (separadas por coma, Enter para omitir): "
     ).strip()
     if not raw:
         return []
@@ -896,6 +993,9 @@ def collect_interactive_filters(
     )
 
     args.count_by = prompt_count_by(args.count_by, fieldnames)
+    args.stats = prompt_stats_columns(args.stats, fieldnames)
+    if args.stats and prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
+        args.percentiles = prompt_value("Percentiles (separados por coma)", args.percentiles)
 
     if not args.output_csv and prompt_yes_no("¿Deseas exportar los filtrados a CSV?"):
         args.output_csv = prompt_value("Ruta del CSV de salida", "filtrados.csv")
@@ -945,7 +1045,15 @@ def main() -> None:
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
         sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
+    percentiles = parse_percentiles(args.percentiles)
+    stats_columns = list(dict.fromkeys(args.stats))
+    invalid_stats = [column for column in stats_columns if column not in fieldnames]
+    if invalid_stats:
+        raise AnalysisError(
+            "Columnas inválidas para estadísticas: " + ", ".join(invalid_stats)
+        )
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
+    stats_values: Dict[str, List[float]] = {column: [] for column in stats_columns}
 
     output_writer = None
     output_handle = None
@@ -974,6 +1082,10 @@ def main() -> None:
                 matched_rows += 1
                 enriched = add_label_columns(row, maps) if args.add_labels else row
                 filtered_rows.append(enriched)
+                for column in stats_values:
+                    value = to_float(row.get(column, ""))
+                    if value is not None:
+                        stats_values[column].append(value)
             if filtered_rows:
                 sort_rows(filtered_rows, sort_keys)
             if output_writer:
@@ -999,6 +1111,10 @@ def main() -> None:
                     if args.add_labels:
                         value = label_value(column, value, maps)
                     counts[column][value] += 1
+                for column in stats_values:
+                    value = to_float(row.get(column, ""))
+                    if value is not None:
+                        stats_values[column].append(value)
     finally:
         if output_handle:
             output_handle.close()
@@ -1009,6 +1125,8 @@ def main() -> None:
 
     if counts:
         print_counts(counts)
+    if stats_values:
+        print_statistics(stats_values, percentiles)
 
 
 if __name__ == "__main__":
