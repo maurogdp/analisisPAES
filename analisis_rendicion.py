@@ -625,16 +625,34 @@ def prompt_count_by(existing: List[str], fieldnames: List[str]) -> List[str]:
 def prompt_stats_columns(existing: List[str], fieldnames: List[str]) -> List[str]:
     if existing:
         return existing
+    print_column_index(fieldnames)
     raw = input(
-        "Columnas numéricas para estadísticas (separadas por coma, Enter para omitir): "
+        "Columnas numéricas para estadísticas (separadas por coma, "
+        "puedes usar números, Enter para omitir): "
     ).strip()
     if not raw:
         return []
     requested = [item.strip() for item in raw.split(",") if item.strip()]
-    invalid = [item for item in requested if item not in fieldnames]
+    selected: List[str] = []
+    invalid: List[str] = []
+    for item in requested:
+        if item.isdigit():
+            idx = int(item)
+            if 1 <= idx <= len(fieldnames):
+                selected.append(fieldnames[idx - 1])
+            else:
+                invalid.append(item)
+        elif item in fieldnames:
+            selected.append(item)
+        else:
+            invalid.append(item)
     if invalid:
         print(f"Columnas inválidas ignoradas: {', '.join(invalid)}")
-    return [item for item in requested if item in fieldnames]
+    unique_selected = []
+    for column in selected:
+        if column not in unique_selected:
+            unique_selected.append(column)
+    return unique_selected
 
 
 def prompt_sort_by(existing: List[str], fieldnames: List[str]) -> List[str]:
@@ -811,6 +829,40 @@ def count_filtered_rows(
             print(f"- {short} = {original}")
 
 
+def export_filtered_rows(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    sort_keys: Sequence[SortKey],
+    output_path: Path,
+) -> None:
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    _, rows = read_csv_rows(data_path)
+    total_rows = 0
+    matched_rows = 0
+    filtered_rows: List[Dict[str, str]] = []
+    for row in rows:
+        total_rows += 1
+        if not row_matches(row, column_filters, min_list, max_list):
+            continue
+        matched_rows += 1
+        filtered_rows.append(row)
+    if sort_keys:
+        sort_rows(filtered_rows, sort_keys)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in filtered_rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+    print("\nExportación completada:")
+    print(f"- Ruta: {output_path}")
+    print(f"- Total de registros: {total_rows}")
+    print(f"- Registros exportados: {matched_rows}")
+
+
 def show_filtered_statistics(
     data_path: Path,
     fieldnames: List[str],
@@ -863,11 +915,20 @@ def manage_filters(
     initial_sort_by: List[str],
     sort_keys: List[SortKey],
     default_percentiles: str,
-) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float], List[str], List[SortKey]]:
+    initial_output_csv: Optional[str],
+) -> Tuple[
+    Dict[str, set[str]],
+    Dict[str, float],
+    Dict[str, float],
+    List[str],
+    List[SortKey],
+    Optional[str],
+]:
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
     max_scores = dict(initial_max_scores)
     sort_by = list(initial_sort_by)
+    output_csv = initial_output_csv
     value_cache: Dict[str, Counter] = {}
     while True:
         summarize_filters(column_filters, min_scores, max_scores)
@@ -882,8 +943,9 @@ def manage_filters(
             "5. Ordenar datos\n"
             "6. Mostrar datos actuales\n"
             "7. Ver estadísticos\n"
-            "8. Continuar\n"
-            "9. Terminar programa"
+            "8. Exportar filtrados a CSV\n"
+            "9. Continuar\n"
+            "10. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -989,8 +1051,22 @@ def manage_filters(
                 default_percentiles,
             )
         elif choice == "8":
-            return column_filters, min_scores, max_scores, sort_by, sort_keys
+            output_csv = prompt_value(
+                "Ruta del CSV de salida", output_csv or "filtrados.csv"
+            )
+            if output_csv:
+                export_filtered_rows(
+                    data_path,
+                    fieldnames,
+                    column_filters,
+                    min_scores,
+                    max_scores,
+                    sort_keys,
+                    Path(output_csv),
+                )
         elif choice == "9":
+            return column_filters, min_scores, max_scores, sort_by, sort_keys, output_csv
+        elif choice == "10":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -1034,7 +1110,14 @@ def collect_interactive_filters(
     args.sort_by = prompt_sort_by(args.sort_by, fieldnames)
     sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
 
-    column_filters, min_scores, max_scores, args.sort_by, sort_keys = manage_filters(
+    (
+        column_filters,
+        min_scores,
+        max_scores,
+        args.sort_by,
+        sort_keys,
+        output_csv,
+    ) = manage_filters(
         fieldnames,
         data_path,
         maps,
@@ -1044,6 +1127,7 @@ def collect_interactive_filters(
         args.sort_by,
         sort_keys,
         args.percentiles,
+        args.output_csv,
     )
 
     args.count_by = prompt_count_by(args.count_by, fieldnames)
@@ -1051,6 +1135,8 @@ def collect_interactive_filters(
     if args.stats and prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
         args.percentiles = prompt_value("Percentiles (separados por coma)", args.percentiles)
 
+    if output_csv:
+        args.output_csv = output_csv
     if not args.output_csv and prompt_yes_no("¿Deseas exportar los filtrados a CSV?"):
         args.output_csv = prompt_value("Ruta del CSV de salida", "filtrados.csv")
 
