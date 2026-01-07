@@ -61,6 +61,13 @@ class SortKey:
     descending: bool = False
 
 
+@dataclass
+class WeightingConfig:
+    weights: Dict[str, float]
+    history_science_mode: str
+    enabled: bool = False
+
+
 class AnalysisError(Exception):
     pass
 
@@ -104,6 +111,16 @@ SCIENCE_MODULE_COLUMNS = [
     ("CIEN_INV_ANTERIOR", "MODULO_INV_ANTERIOR"),
 ]
 SCIENCE_MAX_MODULE_COLUMN = "MODULO_CIEN_MAX"
+WEIGHTED_SCORE_COLUMN = "PUNTAJE_PONDERADO"
+WEIGHTED_SUBJECTS = [
+    ("nem", "NEM"),
+    ("ranking", "Ranking"),
+    ("clec", "Competencia Lectora"),
+    ("mate1", "Matemática 1"),
+    ("mate2", "Matemática 2"),
+    ("historia", "Historia/Ciencias Sociales"),
+    ("ciencias", "Ciencias"),
+]
 
 def discover_rendicion_csvs(base_dir: Path) -> List[Path]:
     preferred: List[Path] = []
@@ -300,6 +317,111 @@ def apply_max_scores(row: Dict[str, str], enabled: bool) -> Dict[str, str]:
             best_science = value
             module_value = row.get(module_column, "") or ""
     transformed[SCIENCE_MAX_MODULE_COLUMN] = module_value
+    return transformed
+
+
+def build_active_fieldnames(
+    fieldnames: Sequence[str],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+) -> List[str]:
+    updated = build_max_fieldnames(fieldnames, use_max_scores)
+    if weighting and weighting.enabled and WEIGHTED_SCORE_COLUMN not in updated:
+        updated.append(WEIGHTED_SCORE_COLUMN)
+    return updated
+
+
+def subject_columns_for_weighting(use_max_scores: bool) -> Dict[str, str]:
+    return {
+        "nem": "PTJE_NEM",
+        "ranking": "PTJE_RANKING",
+        "clec": "CLEC_MAX" if use_max_scores else "CLEC_REG_ACTUAL",
+        "mate1": "MATE1_MAX" if use_max_scores else "MATE1_REG_ACTUAL",
+        "mate2": "MATE2_MAX" if use_max_scores else "MATE2_REG_ACTUAL",
+        "historia": "HCSOC_MAX" if use_max_scores else "HCSOC_REG_ACTUAL",
+        "ciencias": "CIEN_MAX" if use_max_scores else "CIEN_REG_ACTUAL",
+    }
+
+
+def compute_weighted_score(
+    row: Dict[str, str],
+    weighting: WeightingConfig,
+    subject_columns: Dict[str, str],
+) -> Optional[float]:
+    if not weighting.enabled:
+        return None
+    total = 0.0
+    used = False
+    for subject in ["nem", "ranking", "clec", "mate1", "mate2"]:
+        weight = weighting.weights.get(subject, 0.0)
+        if weight <= 0:
+            continue
+        value = to_float(row.get(subject_columns.get(subject, ""), "") or "")
+        if value is None:
+            return None
+        total += value * (weight / 100)
+        used = True
+
+    history_weight = weighting.weights.get("historia", 0.0)
+    science_weight = weighting.weights.get("ciencias", 0.0)
+    if weighting.history_science_mode == "ciencias":
+        history_weight = 0.0
+    elif weighting.history_science_mode == "historia":
+        science_weight = 0.0
+
+    if weighting.history_science_mode == "mejor":
+        history_value = None
+        science_value = None
+        if history_weight > 0:
+            history_value = to_float(
+                row.get(subject_columns.get("historia", ""), "") or ""
+            )
+            if history_value is None:
+                history_value = None
+        if science_weight > 0:
+            science_value = to_float(
+                row.get(subject_columns.get("ciencias", ""), "") or ""
+            )
+            if science_value is None:
+                science_value = None
+        candidates = []
+        if history_weight > 0 and history_value is not None:
+            candidates.append(history_value * (history_weight / 100))
+        if science_weight > 0 and science_value is not None:
+            candidates.append(science_value * (science_weight / 100))
+        if history_weight > 0 or science_weight > 0:
+            if not candidates:
+                return None
+            total += max(candidates)
+            used = True
+    else:
+        for subject, weight in [("historia", history_weight), ("ciencias", science_weight)]:
+            if weight <= 0:
+                continue
+            value = to_float(row.get(subject_columns.get(subject, ""), "") or "")
+            if value is None:
+                return None
+            total += value * (weight / 100)
+            used = True
+
+    return total if used else None
+
+
+def apply_weighted_score(
+    row: Dict[str, str],
+    weighting: Optional[WeightingConfig],
+    subject_columns: Dict[str, str],
+) -> Dict[str, str]:
+    if not weighting or not weighting.enabled:
+        return row
+    weighted_value = compute_weighted_score(row, weighting, subject_columns)
+    transformed = dict(row)
+    if weighted_value is None:
+        transformed[WEIGHTED_SCORE_COLUMN] = ""
+    elif weighted_value.is_integer():
+        transformed[WEIGHTED_SCORE_COLUMN] = str(int(weighted_value))
+    else:
+        transformed[WEIGHTED_SCORE_COLUMN] = f"{weighted_value:.2f}"
     return transformed
 
 
@@ -926,6 +1048,75 @@ def summarize_filters(
         print(f"- {column} <= {threshold}")
 
 
+def summarize_weighting(weighting: Optional[WeightingConfig]) -> None:
+    if not weighting or not weighting.enabled:
+        print("- Ponderación: (no configurada)")
+        return
+    parts = []
+    for key, label in WEIGHTED_SUBJECTS:
+        weight = weighting.weights.get(key, 0.0)
+        if weight:
+            parts.append(f"{label} {weight}%")
+    mode_label = {
+        "mejor": "Mejor entre historia y ciencias",
+        "ciencias": "Solo ciencias",
+        "historia": "Solo historia",
+    }.get(weighting.history_science_mode, weighting.history_science_mode)
+    print("- Ponderación: " + (", ".join(parts) if parts else "(sin pesos)"))
+    print(f"- Hist/Ciencias: {mode_label}")
+
+
+def prompt_weight_value(label: str, current: float) -> float:
+    while True:
+        raw = input(f"{label} [{current}%]: ").strip()
+        if not raw:
+            return current
+        try:
+            return float(raw)
+        except ValueError:
+            print("Número inválido. Usa un porcentaje (ej: 20).")
+
+
+def prompt_weighting(
+    weighting: Optional[WeightingConfig],
+    use_max_scores: bool,
+) -> WeightingConfig:
+    current_weights = (
+        dict(weighting.weights)
+        if weighting
+        else {key: 0.0 for key, _ in WEIGHTED_SUBJECTS}
+    )
+    print("\nConfigurar ponderación (porcentajes):")
+    for key, label in WEIGHTED_SUBJECTS:
+        current_weights[key] = prompt_weight_value(label, current_weights.get(key, 0.0))
+    total_weight = sum(current_weights.values())
+    if total_weight and total_weight != 100:
+        print(f"Advertencia: la suma de ponderaciones es {total_weight}%.")
+
+    mode_options = [
+        "Mejor ponderado entre Historia/Ciencias",
+        "Solo Ciencias",
+        "Solo Historia",
+    ]
+    mode_default = 1
+    if weighting:
+        mode_default = {"mejor": 1, "ciencias": 2, "historia": 3}.get(
+            weighting.history_science_mode, 1
+        )
+    selection = prompt_choice("Modo Historia/Ciencias:", mode_options, default=mode_default)
+    history_science_mode = {1: "mejor", 2: "ciencias", 3: "historia"}[selection]
+    subject_columns = subject_columns_for_weighting(use_max_scores)
+    print("\nColumnas usadas para la ponderación:")
+    for key, label in WEIGHTED_SUBJECTS:
+        column = subject_columns.get(key, "(no definida)")
+        print(f"- {label}: {column}")
+    return WeightingConfig(
+        weights=current_weights,
+        history_science_mode=history_science_mode,
+        enabled=True,
+    )
+
+
 def build_filter_index(
     column_filters: Dict[str, set[str]],
     min_scores: Dict[str, float],
@@ -1021,16 +1212,19 @@ def count_filtered_rows(
     max_scores: Dict[str, float],
     sort_keys: Sequence[SortKey],
     use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
 ) -> None:
     _, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
+        transformed = apply_weighted_score(transformed, weighting, subject_columns)
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1071,16 +1265,19 @@ def export_filtered_rows(
     sort_keys: Sequence[SortKey],
     output_path: Path,
     use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
 ) -> None:
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     _, rows = read_csv_rows(data_path)
+    subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
+        transformed = apply_weighted_score(transformed, weighting, subject_columns)
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1106,6 +1303,7 @@ def show_filtered_statistics(
     max_scores: Dict[str, float],
     default_percentiles: str,
     use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
 ) -> None:
     stats_columns = prompt_stats_columns([], fieldnames)
     if not stats_columns:
@@ -1125,11 +1323,13 @@ def show_filtered_statistics(
     stats_zero_counts: Dict[str, int] = {column: 0 for column in stats_columns}
 
     _, rows = read_csv_rows(data_path)
+    subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
+        transformed = apply_weighted_score(transformed, weighting, subject_columns)
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1157,6 +1357,7 @@ def show_filtered_rbd_statistics(
     max_scores: Dict[str, float],
     default_percentiles: str,
     use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
 ) -> None:
     rbd_values = column_filters.get("RBD") or set()
     if not rbd_values:
@@ -1189,11 +1390,13 @@ def show_filtered_rbd_statistics(
     }
 
     _, rows = read_csv_rows(data_path)
+    subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
+        transformed = apply_weighted_score(transformed, weighting, subject_columns)
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1234,6 +1437,7 @@ def manage_filters(
     default_percentiles: str,
     initial_output_csv: Optional[str],
     use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
 ) -> Tuple[
     Dict[str, set[str]],
     Dict[str, float],
@@ -1242,6 +1446,7 @@ def manage_filters(
     List[SortKey],
     Optional[str],
     bool,
+    Optional[WeightingConfig],
 ]:
     base_fieldnames = list(fieldnames)
     column_filters = dict(initial_column_filters)
@@ -1249,9 +1454,11 @@ def manage_filters(
     max_scores = dict(initial_max_scores)
     sort_by = list(initial_sort_by)
     output_csv = initial_output_csv
+    weighting_config = weighting
     value_cache: Dict[str, Counter] = {}
     while True:
         summarize_filters(column_filters, min_scores, max_scores)
+        summarize_weighting(weighting_config)
         if sort_by:
             print(f"- Orden actual: {', '.join(sort_by)}")
         print(
@@ -1266,8 +1473,10 @@ def manage_filters(
             "8. Ver estadísticos por RBD\n"
             "9. Exportar filtrados a CSV\n"
             "10. Alternar puntajes MAX\n"
-            "11. Continuar\n"
-            "12. Terminar programa"
+            "11. Configurar ponderación\n"
+            "12. Eliminar ponderación\n"
+            "13. Continuar\n"
+            "14. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1364,6 +1573,7 @@ def manage_filters(
                 max_scores,
                 sort_keys,
                 use_max_scores,
+                weighting_config,
             )
         elif choice == "7":
             show_filtered_statistics(
@@ -1374,6 +1584,7 @@ def manage_filters(
                 max_scores,
                 default_percentiles,
                 use_max_scores,
+                weighting_config,
             )
         elif choice == "8":
             show_filtered_rbd_statistics(
@@ -1384,6 +1595,7 @@ def manage_filters(
                 max_scores,
                 default_percentiles,
                 use_max_scores,
+                weighting_config,
             )
         elif choice == "9":
             output_csv = prompt_value(
@@ -1399,10 +1611,13 @@ def manage_filters(
                     sort_keys,
                     Path(output_csv),
                     use_max_scores,
+                    weighting_config,
                 )
         elif choice == "10":
             use_max_scores = not use_max_scores
-            fieldnames = build_max_fieldnames(base_fieldnames, use_max_scores)
+            fieldnames = build_active_fieldnames(
+                base_fieldnames, use_max_scores, weighting_config
+            )
             (
                 column_filters,
                 min_scores,
@@ -1419,6 +1634,50 @@ def manage_filters(
             estado = "activado" if use_max_scores else "desactivado"
             print(f"Modo puntajes MAX {estado}.")
         elif choice == "11":
+            weighting_config = prompt_weighting(weighting_config, use_max_scores)
+            fieldnames = build_active_fieldnames(
+                base_fieldnames, use_max_scores, weighting_config
+            )
+            (
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+            ) = prune_filters_for_fieldnames(
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+                fieldnames,
+            )
+            sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
+        elif choice == "12":
+            if weighting_config and weighting_config.enabled:
+                weighting_config = WeightingConfig(
+                    weights=weighting_config.weights,
+                    history_science_mode=weighting_config.history_science_mode,
+                    enabled=False,
+                )
+                fieldnames = build_active_fieldnames(
+                    base_fieldnames, use_max_scores, weighting_config
+                )
+                (
+                    column_filters,
+                    min_scores,
+                    max_scores,
+                    sort_by,
+                ) = prune_filters_for_fieldnames(
+                    column_filters,
+                    min_scores,
+                    max_scores,
+                    sort_by,
+                    fieldnames,
+                )
+                sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
+                print("Ponderación eliminada.")
+            else:
+                print("No hay ponderación activa para eliminar.")
+        elif choice == "13":
             return (
                 column_filters,
                 min_scores,
@@ -1427,8 +1686,9 @@ def manage_filters(
                 sort_keys,
                 output_csv,
                 use_max_scores,
+                weighting_config,
             )
-        elif choice == "12":
+        elif choice == "14":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -1446,6 +1706,7 @@ def collect_interactive_filters(
     List[ScoreFilter],
     List[SortKey],
     bool,
+    Optional[WeightingConfig],
 ]:
     print("=== Modo interactivo: análisis de rendición ===")
 
@@ -1479,6 +1740,7 @@ def collect_interactive_filters(
     sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
 
     use_max_scores = False
+    weighting_config = None
     (
         column_filters,
         min_scores,
@@ -1487,6 +1749,7 @@ def collect_interactive_filters(
         sort_keys,
         output_csv,
         use_max_scores,
+        weighting_config,
     ) = manage_filters(
         fieldnames,
         data_path,
@@ -1499,9 +1762,12 @@ def collect_interactive_filters(
         args.percentiles,
         args.output_csv,
         use_max_scores,
+        weighting_config,
     )
 
-    active_fieldnames = build_max_fieldnames(fieldnames, use_max_scores)
+    active_fieldnames = build_active_fieldnames(
+        fieldnames, use_max_scores, weighting_config
+    )
     args.count_by = prompt_count_by(args.count_by, active_fieldnames)
     args.stats = prompt_stats_columns(args.stats, active_fieldnames)
     if args.stats and prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
@@ -1517,7 +1783,7 @@ def collect_interactive_filters(
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
-    return column_filters, min_list, max_list, sort_keys, use_max_scores
+    return column_filters, min_list, max_list, sort_keys, use_max_scores, weighting_config
 
 
 def main() -> None:
@@ -1541,6 +1807,7 @@ def main() -> None:
     )
 
     use_max_scores = False
+    weighting_config = None
     if args.interactive or len(sys.argv) == 1:
         (
             column_filters,
@@ -1548,6 +1815,7 @@ def main() -> None:
             max_scores,
             sort_keys,
             use_max_scores,
+            weighting_config,
         ) = collect_interactive_filters(args, fieldnames, data_path, maps)
     else:
         column_filters = {
@@ -1562,7 +1830,9 @@ def main() -> None:
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
         sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
-    active_fieldnames = build_max_fieldnames(fieldnames, use_max_scores)
+    active_fieldnames = build_active_fieldnames(
+        fieldnames, use_max_scores, weighting_config
+    )
     percentiles = parse_percentiles(args.percentiles)
     stats_columns = list(dict.fromkeys(args.stats))
     if args.stats_by_rbd and not stats_columns:
@@ -1612,6 +1882,7 @@ def main() -> None:
 
     total_rows = 0
     matched_rows = 0
+    subject_columns = subject_columns_for_weighting(use_max_scores)
 
     try:
         if sort_keys:
@@ -1619,6 +1890,9 @@ def main() -> None:
             for row in rows:
                 total_rows += 1
                 transformed = apply_max_scores(row, use_max_scores)
+                transformed = apply_weighted_score(
+                    transformed, weighting_config, subject_columns
+                )
                 if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
@@ -1665,6 +1939,9 @@ def main() -> None:
             for row in rows:
                 total_rows += 1
                 transformed = apply_max_scores(row, use_max_scores)
+                transformed = apply_weighted_score(
+                    transformed, weighting_config, subject_columns
+                )
                 if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
