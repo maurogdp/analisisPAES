@@ -7,6 +7,8 @@ Ejemplos de uso:
       --output-csv filtrados.csv --add-labels
   python analisis_rendicion.py --region 6 --stats CLEC_REG_ACTUAL --stats MATE1_REG_ACTUAL \
       --percentiles 25,50,75
+  python analisis_rendicion.py --rbd 12345,67890 --stats CLEC_REG_ACTUAL --stats MATE1_REG_ACTUAL \
+      --stats-by-rbd
   python analisis_rendicion.py --sort-by CODIGO_REGION:asc --sort-by PUNTAJE:desc --output-csv ordenados.csv
 """
 
@@ -441,6 +443,43 @@ def print_statistics(
     print_table(headers, rows)
 
 
+def print_rbd_statistics(
+    stats_by_rbd: Dict[str, Dict[str, List[float]]],
+    percentiles: Sequence[float],
+) -> None:
+    if not stats_by_rbd:
+        return
+    print("\nEstadísticas por RBD (filtradas):")
+    base_headers = ["RBD", "Columna", "N", "Promedio", "Mediana", "Desv. Est."]
+    percentile_headers = [f"P{int(p)}" if p.is_integer() else f"P{p}" for p in percentiles]
+    headers = base_headers + percentile_headers
+    rows = []
+    for rbd in sorted(stats_by_rbd.keys()):
+        for column in sorted(stats_by_rbd[rbd].keys()):
+            values = stats_by_rbd[rbd][column]
+            cleaned = [value for value in values if value is not None]
+            if not cleaned:
+                rows.append([rbd, column, "0", "-", "-", "-"] + ["-" for _ in percentiles])
+                continue
+            ordered = sorted(cleaned)
+            avg = mean(ordered)
+            med = median(ordered)
+            deviation = pstdev(ordered) if len(ordered) > 1 else 0.0
+            row = [
+                rbd,
+                column,
+                str(len(ordered)),
+                f"{avg:.2f}",
+                f"{med:.2f}",
+                f"{deviation:.2f}",
+            ]
+            for perc in percentiles:
+                value = percentile(ordered, perc)
+                row.append(f"{value:.2f}" if value is not None else "-")
+            rows.append(row)
+    print_table(headers, rows)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Analiza archivos de rendición con filtros y recuentos.",
@@ -501,6 +540,11 @@ def parse_args() -> argparse.Namespace:
         "--percentiles",
         default="25,50,75",
         help="Percentiles a calcular para --stats (separados por coma).",
+    )
+    parser.add_argument(
+        "--stats-by-rbd",
+        action="store_true",
+        help="Calcula estadísticas por cada RBD indicado en --rbd.",
     )
     parser.add_argument(
         "--sort-by",
@@ -1187,6 +1231,8 @@ def main() -> None:
         sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
     percentiles = parse_percentiles(args.percentiles)
     stats_columns = list(dict.fromkeys(args.stats))
+    if args.stats_by_rbd and not stats_columns:
+        raise AnalysisError("Debes indicar al menos una columna en --stats para --stats-by-rbd.")
     invalid_stats = [column for column in stats_columns if column not in fieldnames]
     if invalid_stats:
         raise AnalysisError(
@@ -1194,6 +1240,15 @@ def main() -> None:
         )
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
     stats_values: Dict[str, List[float]] = {column: [] for column in stats_columns}
+    stats_by_rbd: Optional[Dict[str, Dict[str, List[float]]]] = None
+    if args.stats_by_rbd:
+        rbd_values = column_filters.get("RBD") or set()
+        if not rbd_values:
+            raise AnalysisError("Para --stats-by-rbd debes indicar --rbd con al menos un valor.")
+        stats_by_rbd = {
+            rbd: {column: [] for column in stats_columns}
+            for rbd in sorted(rbd_values)
+        }
 
     output_writer = None
     output_handle = None
@@ -1226,6 +1281,13 @@ def main() -> None:
                     value = to_float(row.get(column, ""))
                     if value is not None:
                         stats_values[column].append(value)
+                if stats_by_rbd is not None:
+                    rbd = normalize_code(row.get("RBD"))
+                    if rbd in stats_by_rbd:
+                        for column in stats_columns:
+                            value = to_float(row.get(column, ""))
+                            if value is not None:
+                                stats_by_rbd[rbd][column].append(value)
             if filtered_rows:
                 sort_rows(filtered_rows, sort_keys)
             if output_writer:
@@ -1255,6 +1317,13 @@ def main() -> None:
                     value = to_float(row.get(column, ""))
                     if value is not None:
                         stats_values[column].append(value)
+                if stats_by_rbd is not None:
+                    rbd = normalize_code(row.get("RBD"))
+                    if rbd in stats_by_rbd:
+                        for column in stats_columns:
+                            value = to_float(row.get(column, ""))
+                            if value is not None:
+                                stats_by_rbd[rbd][column].append(value)
     finally:
         if output_handle:
             output_handle.close()
@@ -1267,6 +1336,8 @@ def main() -> None:
         print_counts(counts)
     if stats_values:
         print_statistics(stats_values, percentiles)
+    if stats_by_rbd:
+        print_rbd_statistics(stats_by_rbd, percentiles)
 
 
 if __name__ == "__main__":
