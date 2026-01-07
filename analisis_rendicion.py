@@ -949,6 +949,58 @@ def show_filtered_statistics(
     print_statistics(stats_values, percentiles)
 
 
+def show_filtered_rbd_statistics(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    default_percentiles: str,
+) -> None:
+    rbd_values = column_filters.get("RBD") or set()
+    if not rbd_values:
+        print("Debes indicar un filtro de RBD para ver estadísticas por RBD.")
+        return
+    stats_columns = prompt_stats_columns([], fieldnames)
+    if not stats_columns:
+        print("No se seleccionaron columnas para estadísticas.")
+        return
+    percentiles_raw = default_percentiles
+    if prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
+        percentiles_raw = prompt_value(
+            "Percentiles (separados por coma)", default_percentiles
+        )
+    percentiles = parse_percentiles(percentiles_raw)
+
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    stats_by_rbd: Dict[str, Dict[str, List[float]]] = {
+        rbd: {column: [] for column in stats_columns}
+        for rbd in sorted(rbd_values)
+    }
+
+    _, rows = read_csv_rows(data_path)
+    total_rows = 0
+    matched_rows = 0
+    for row in rows:
+        total_rows += 1
+        if not row_matches(row, column_filters, min_list, max_list):
+            continue
+        matched_rows += 1
+        rbd = normalize_code(row.get("RBD"))
+        if rbd not in stats_by_rbd:
+            continue
+        for column in stats_columns:
+            value = to_float(row.get(column, ""))
+            if value is not None:
+                stats_by_rbd[rbd][column].append(value)
+
+    print("\nResumen estadístico por RBD con filtros actuales:")
+    print(f"- Total de registros: {total_rows}")
+    print(f"- Registros filtrados: {matched_rows}")
+    print_rbd_statistics(stats_by_rbd, percentiles)
+
+
 def manage_filters(
     fieldnames: List[str],
     data_path: Path,
@@ -987,9 +1039,10 @@ def manage_filters(
             "5. Ordenar datos\n"
             "6. Mostrar datos actuales\n"
             "7. Ver estadísticos\n"
-            "8. Exportar filtrados a CSV\n"
-            "9. Continuar\n"
-            "10. Terminar programa"
+            "8. Ver estadísticos por RBD\n"
+            "9. Exportar filtrados a CSV\n"
+            "10. Continuar\n"
+            "11. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1095,6 +1148,15 @@ def manage_filters(
                 default_percentiles,
             )
         elif choice == "8":
+            show_filtered_rbd_statistics(
+                data_path,
+                fieldnames,
+                column_filters,
+                min_scores,
+                max_scores,
+                default_percentiles,
+            )
+        elif choice == "9":
             output_csv = prompt_value(
                 "Ruta del CSV de salida", output_csv or "filtrados.csv"
             )
@@ -1108,9 +1170,9 @@ def manage_filters(
                     sort_keys,
                     Path(output_csv),
                 )
-        elif choice == "9":
-            return column_filters, min_scores, max_scores, sort_by, sort_keys, output_csv
         elif choice == "10":
+            return column_filters, min_scores, max_scores, sort_by, sort_keys, output_csv
+        elif choice == "11":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
