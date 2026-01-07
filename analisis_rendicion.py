@@ -409,12 +409,66 @@ def percentile(sorted_values: List[float], percent: float) -> Optional[float]:
     return lower_value + (upper_value - lower_value) * fraction
 
 
+def record_stat_value(
+    column: str,
+    value: Optional[float],
+    stats_values: Dict[str, List[float]],
+    totals: Dict[str, int],
+    zero_counts: Dict[str, int],
+) -> None:
+    if value is None:
+        return
+    totals[column] += 1
+    if value == 0:
+        zero_counts[column] += 1
+        return
+    stats_values[column].append(value)
+
+
+def record_stat_value_by_rbd(
+    rbd: str,
+    column: str,
+    value: Optional[float],
+    stats_by_rbd: Dict[str, Dict[str, List[float]]],
+    totals_by_rbd: Dict[str, Dict[str, int]],
+    zero_counts_by_rbd: Dict[str, Dict[str, int]],
+) -> None:
+    if value is None:
+        return
+    totals_by_rbd[rbd][column] += 1
+    if value == 0:
+        zero_counts_by_rbd[rbd][column] += 1
+        return
+    stats_by_rbd[rbd][column].append(value)
+
+
+def print_zero_exclusions(
+    totals: Dict[str, int],
+    zero_counts: Dict[str, int],
+) -> None:
+    if not totals:
+        return
+    print("\nValores 0 excluidos de estadísticas:")
+    headers = ["Columna", "Total", "Ceros excluidos", "Considerados"]
+    rows = []
+    for column in totals:
+        total = totals[column]
+        zeros = zero_counts.get(column, 0)
+        considered = max(total - zeros, 0)
+        rows.append([column, str(total), str(zeros), str(considered)])
+    print_table(headers, rows)
+
+
 def print_statistics(
     stats: Dict[str, List[float]],
     percentiles: Sequence[float],
+    totals: Optional[Dict[str, int]] = None,
+    zero_counts: Optional[Dict[str, int]] = None,
 ) -> None:
     if not stats:
         return
+    if totals is not None and zero_counts is not None:
+        print_zero_exclusions(totals, zero_counts)
     print("\nEstadísticas de columnas (filtradas):")
     base_headers = ["Columna", "N", "Promedio", "Mediana", "Desv. Est."]
     percentile_headers = [f"P{int(p)}" if p.is_integer() else f"P{p}" for p in percentiles]
@@ -443,12 +497,34 @@ def print_statistics(
     print_table(headers, rows)
 
 
+def print_zero_exclusions_by_rbd(
+    totals_by_rbd: Dict[str, Dict[str, int]],
+    zero_counts_by_rbd: Dict[str, Dict[str, int]],
+) -> None:
+    if not totals_by_rbd:
+        return
+    print("\nValores 0 excluidos por RBD:")
+    headers = ["RBD", "Columna", "Total", "Ceros excluidos", "Considerados"]
+    rows = []
+    for rbd in sorted(totals_by_rbd.keys()):
+        for column in sorted(totals_by_rbd[rbd].keys()):
+            total = totals_by_rbd[rbd][column]
+            zeros = zero_counts_by_rbd.get(rbd, {}).get(column, 0)
+            considered = max(total - zeros, 0)
+            rows.append([rbd, column, str(total), str(zeros), str(considered)])
+    print_table(headers, rows)
+
+
 def print_rbd_statistics(
     stats_by_rbd: Dict[str, Dict[str, List[float]]],
     percentiles: Sequence[float],
+    totals_by_rbd: Optional[Dict[str, Dict[str, int]]] = None,
+    zero_counts_by_rbd: Optional[Dict[str, Dict[str, int]]] = None,
 ) -> None:
     if not stats_by_rbd:
         return
+    if totals_by_rbd is not None and zero_counts_by_rbd is not None:
+        print_zero_exclusions_by_rbd(totals_by_rbd, zero_counts_by_rbd)
     print("\nEstadísticas por RBD (filtradas):")
     base_headers = ["RBD", "Columna", "N", "Promedio", "Mediana", "Desv. Est."]
     percentile_headers = [f"P{int(p)}" if p.is_integer() else f"P{p}" for p in percentiles]
@@ -929,6 +1005,8 @@ def show_filtered_statistics(
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     stats_values: Dict[str, List[float]] = {column: [] for column in stats_columns}
+    stats_totals: Dict[str, int] = {column: 0 for column in stats_columns}
+    stats_zero_counts: Dict[str, int] = {column: 0 for column in stats_columns}
 
     fieldnames, rows = read_csv_rows(data_path)
     total_rows = 0
@@ -940,13 +1018,18 @@ def show_filtered_statistics(
         matched_rows += 1
         for column in stats_values:
             value = to_float(row.get(column, ""))
-            if value is not None:
-                stats_values[column].append(value)
+            record_stat_value(
+                column,
+                value,
+                stats_values,
+                stats_totals,
+                stats_zero_counts,
+            )
 
     print("\nResumen estadístico con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
-    print_statistics(stats_values, percentiles)
+    print_statistics(stats_values, percentiles, stats_totals, stats_zero_counts)
 
 
 def show_filtered_rbd_statistics(
@@ -978,6 +1061,14 @@ def show_filtered_rbd_statistics(
         rbd: {column: [] for column in stats_columns}
         for rbd in sorted(rbd_values)
     }
+    stats_totals_by_rbd: Dict[str, Dict[str, int]] = {
+        rbd: {column: 0 for column in stats_columns}
+        for rbd in sorted(rbd_values)
+    }
+    stats_zero_counts_by_rbd: Dict[str, Dict[str, int]] = {
+        rbd: {column: 0 for column in stats_columns}
+        for rbd in sorted(rbd_values)
+    }
 
     _, rows = read_csv_rows(data_path)
     total_rows = 0
@@ -992,13 +1083,24 @@ def show_filtered_rbd_statistics(
             continue
         for column in stats_columns:
             value = to_float(row.get(column, ""))
-            if value is not None:
-                stats_by_rbd[rbd][column].append(value)
+            record_stat_value_by_rbd(
+                rbd,
+                column,
+                value,
+                stats_by_rbd,
+                stats_totals_by_rbd,
+                stats_zero_counts_by_rbd,
+            )
 
     print("\nResumen estadístico por RBD con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
-    print_rbd_statistics(stats_by_rbd, percentiles)
+    print_rbd_statistics(
+        stats_by_rbd,
+        percentiles,
+        stats_totals_by_rbd,
+        stats_zero_counts_by_rbd,
+    )
 
 
 def manage_filters(
@@ -1302,13 +1404,25 @@ def main() -> None:
         )
     counts: Dict[str, Counter] = {column: Counter() for column in args.count_by}
     stats_values: Dict[str, List[float]] = {column: [] for column in stats_columns}
+    stats_totals: Dict[str, int] = {column: 0 for column in stats_columns}
+    stats_zero_counts: Dict[str, int] = {column: 0 for column in stats_columns}
     stats_by_rbd: Optional[Dict[str, Dict[str, List[float]]]] = None
+    stats_totals_by_rbd: Optional[Dict[str, Dict[str, int]]] = None
+    stats_zero_counts_by_rbd: Optional[Dict[str, Dict[str, int]]] = None
     if args.stats_by_rbd:
         rbd_values = column_filters.get("RBD") or set()
         if not rbd_values:
             raise AnalysisError("Para --stats-by-rbd debes indicar --rbd con al menos un valor.")
         stats_by_rbd = {
             rbd: {column: [] for column in stats_columns}
+            for rbd in sorted(rbd_values)
+        }
+        stats_totals_by_rbd = {
+            rbd: {column: 0 for column in stats_columns}
+            for rbd in sorted(rbd_values)
+        }
+        stats_zero_counts_by_rbd = {
+            rbd: {column: 0 for column in stats_columns}
             for rbd in sorted(rbd_values)
         }
 
@@ -1341,15 +1455,26 @@ def main() -> None:
                 filtered_rows.append(enriched)
                 for column in stats_values:
                     value = to_float(row.get(column, ""))
-                    if value is not None:
-                        stats_values[column].append(value)
+                    record_stat_value(
+                        column,
+                        value,
+                        stats_values,
+                        stats_totals,
+                        stats_zero_counts,
+                    )
                 if stats_by_rbd is not None:
                     rbd = normalize_code(row.get("RBD"))
                     if rbd in stats_by_rbd:
                         for column in stats_columns:
                             value = to_float(row.get(column, ""))
-                            if value is not None:
-                                stats_by_rbd[rbd][column].append(value)
+                            record_stat_value_by_rbd(
+                                rbd,
+                                column,
+                                value,
+                                stats_by_rbd,
+                                stats_totals_by_rbd or {},
+                                stats_zero_counts_by_rbd or {},
+                            )
             if filtered_rows:
                 sort_rows(filtered_rows, sort_keys)
             if output_writer:
@@ -1377,15 +1502,26 @@ def main() -> None:
                     counts[column][value] += 1
                 for column in stats_values:
                     value = to_float(row.get(column, ""))
-                    if value is not None:
-                        stats_values[column].append(value)
+                    record_stat_value(
+                        column,
+                        value,
+                        stats_values,
+                        stats_totals,
+                        stats_zero_counts,
+                    )
                 if stats_by_rbd is not None:
                     rbd = normalize_code(row.get("RBD"))
                     if rbd in stats_by_rbd:
                         for column in stats_columns:
                             value = to_float(row.get(column, ""))
-                            if value is not None:
-                                stats_by_rbd[rbd][column].append(value)
+                            record_stat_value_by_rbd(
+                                rbd,
+                                column,
+                                value,
+                                stats_by_rbd,
+                                stats_totals_by_rbd or {},
+                                stats_zero_counts_by_rbd or {},
+                            )
     finally:
         if output_handle:
             output_handle.close()
@@ -1397,9 +1533,14 @@ def main() -> None:
     if counts:
         print_counts(counts)
     if stats_values:
-        print_statistics(stats_values, percentiles)
+        print_statistics(stats_values, percentiles, stats_totals, stats_zero_counts)
     if stats_by_rbd:
-        print_rbd_statistics(stats_by_rbd, percentiles)
+        print_rbd_statistics(
+            stats_by_rbd,
+            percentiles,
+            stats_totals_by_rbd,
+            stats_zero_counts_by_rbd,
+        )
 
 
 if __name__ == "__main__":
