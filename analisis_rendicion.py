@@ -65,6 +65,46 @@ class AnalysisError(Exception):
     pass
 
 
+MAX_SCORE_GROUPS: Dict[str, List[str]] = {
+    "CLEC_MAX": [
+        "CLEC_REG_ACTUAL",
+        "CLEC_INV_ACTUAL",
+        "CLEC_REG_ANTERIOR",
+        "CLEC_INV_ANTERIOR",
+    ],
+    "MATE1_MAX": [
+        "MATE1_REG_ACTUAL",
+        "MATE1_INV_ACTUAL",
+        "MATE1_REG_ANTERIOR",
+        "MATE1_INV_ANTERIOR",
+    ],
+    "MATE2_MAX": [
+        "MATE2_REG_ACTUAL",
+        "MATE2_INV_ACTUAL",
+        "MATE2_REG_ANTERIOR",
+        "MATE2_INV_ANTERIOR",
+    ],
+    "HCSOC_MAX": [
+        "HCSOC_REG_ACTUAL",
+        "HCSOC_INV_ACTUAL",
+        "HCSOC_REG_ANTERIOR",
+        "HCSOC_INV_ANTERIOR",
+    ],
+    "CIEN_MAX": [
+        "CIEN_REG_ACTUAL",
+        "CIEN_INV_ACTUAL",
+        "CIEN_REG_ANTERIOR",
+        "CIEN_INV_ANTERIOR",
+    ],
+}
+SCIENCE_MODULE_COLUMNS = [
+    ("CIEN_REG_ACTUAL", "MODULO_REG_ACTUAL"),
+    ("CIEN_INV_ACTUAL", "MODULO_INV_ACTUAL"),
+    ("CIEN_REG_ANTERIOR", "MODULO_REG_ANTERIOR"),
+    ("CIEN_INV_ANTERIOR", "MODULO_INV_ANTERIOR"),
+]
+SCIENCE_MAX_MODULE_COLUMN = "MODULO_CIEN_MAX"
+
 def discover_rendicion_csvs(base_dir: Path) -> List[Path]:
     preferred: List[Path] = []
     fallback: List[Path] = []
@@ -212,6 +252,76 @@ def sort_rows(rows: List[Dict[str, str]], sort_keys: Sequence[SortKey]) -> None:
 
         rows.sort(key=key, reverse=sort_key.descending)
 
+
+def build_max_fieldnames(fieldnames: Sequence[str], enabled: bool) -> List[str]:
+    if not enabled:
+        return list(fieldnames)
+    remove_columns = {
+        column for columns in MAX_SCORE_GROUPS.values() for column in columns
+    }
+    remove_columns.update(module for _, module in SCIENCE_MODULE_COLUMNS)
+    updated = [name for name in fieldnames if name not in remove_columns]
+    updated.extend(MAX_SCORE_GROUPS.keys())
+    updated.append(SCIENCE_MAX_MODULE_COLUMN)
+    return updated
+
+
+def apply_max_scores(row: Dict[str, str], enabled: bool) -> Dict[str, str]:
+    if not enabled:
+        return row
+    remove_columns = {
+        column for columns in MAX_SCORE_GROUPS.values() for column in columns
+    }
+    remove_columns.update(module for _, module in SCIENCE_MODULE_COLUMNS)
+    transformed = {key: value for key, value in row.items() if key not in remove_columns}
+    def format_score(value: Optional[float]) -> str:
+        if value is None:
+            return ""
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    for max_name, columns in MAX_SCORE_GROUPS.items():
+        best_value: Optional[float] = None
+        for column in columns:
+            value = to_float(row.get(column, "") or "")
+            if value is None:
+                continue
+            if best_value is None or value > best_value:
+                best_value = value
+        transformed[max_name] = format_score(best_value)
+    module_value = ""
+    best_science: Optional[float] = None
+    for score_column, module_column in SCIENCE_MODULE_COLUMNS:
+        value = to_float(row.get(score_column, "") or "")
+        if value is None:
+            continue
+        if best_science is None or value > best_science:
+            best_science = value
+            module_value = row.get(module_column, "") or ""
+    transformed[SCIENCE_MAX_MODULE_COLUMN] = module_value
+    return transformed
+
+
+def prune_filters_for_fieldnames(
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    sort_by: List[str],
+    fieldnames: Sequence[str],
+) -> Tuple[Dict[str, set[str]], Dict[str, float], Dict[str, float], List[str]]:
+    valid_fields = set(fieldnames)
+    column_filters = {
+        column: values for column, values in column_filters.items() if column in valid_fields
+    }
+    min_scores = {column: value for column, value in min_scores.items() if column in valid_fields}
+    max_scores = {column: value for column, value in max_scores.items() if column in valid_fields}
+    filtered_sort_by = []
+    for entry in sort_by:
+        column = entry.split(":", 1)[0].strip()
+        if column in valid_fields:
+            filtered_sort_by.append(entry)
+    return column_filters, min_scores, max_scores, filtered_sort_by
 
 def load_cod_ens(path: Path) -> Dict[str, str]:
     if not path.exists():
@@ -905,12 +1015,14 @@ def prompt_threshold(column: str) -> Optional[float]:
 
 def count_filtered_rows(
     data_path: Path,
+    fieldnames: List[str],
     column_filters: Dict[str, set[str]],
     min_scores: Dict[str, float],
     max_scores: Dict[str, float],
     sort_keys: Sequence[SortKey],
+    use_max_scores: bool,
 ) -> None:
-    fieldnames, rows = read_csv_rows(data_path)
+    _, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     total_rows = 0
@@ -918,10 +1030,11 @@ def count_filtered_rows(
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
-        if not row_matches(row, column_filters, min_list, max_list):
+        transformed = apply_max_scores(row, use_max_scores)
+        if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
-        filtered_rows.append(row)
+        filtered_rows.append(transformed)
     print("\nResumen con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
@@ -957,6 +1070,7 @@ def export_filtered_rows(
     max_scores: Dict[str, float],
     sort_keys: Sequence[SortKey],
     output_path: Path,
+    use_max_scores: bool,
 ) -> None:
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
@@ -966,10 +1080,11 @@ def export_filtered_rows(
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
-        if not row_matches(row, column_filters, min_list, max_list):
+        transformed = apply_max_scores(row, use_max_scores)
+        if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
-        filtered_rows.append(row)
+        filtered_rows.append(transformed)
     if sort_keys:
         sort_rows(filtered_rows, sort_keys)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
@@ -990,6 +1105,7 @@ def show_filtered_statistics(
     min_scores: Dict[str, float],
     max_scores: Dict[str, float],
     default_percentiles: str,
+    use_max_scores: bool,
 ) -> None:
     stats_columns = prompt_stats_columns([], fieldnames)
     if not stats_columns:
@@ -1008,16 +1124,17 @@ def show_filtered_statistics(
     stats_totals: Dict[str, int] = {column: 0 for column in stats_columns}
     stats_zero_counts: Dict[str, int] = {column: 0 for column in stats_columns}
 
-    fieldnames, rows = read_csv_rows(data_path)
+    _, rows = read_csv_rows(data_path)
     total_rows = 0
     matched_rows = 0
     for row in rows:
         total_rows += 1
-        if not row_matches(row, column_filters, min_list, max_list):
+        transformed = apply_max_scores(row, use_max_scores)
+        if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
         for column in stats_values:
-            value = to_float(row.get(column, ""))
+            value = to_float(transformed.get(column, ""))
             record_stat_value(
                 column,
                 value,
@@ -1039,6 +1156,7 @@ def show_filtered_rbd_statistics(
     min_scores: Dict[str, float],
     max_scores: Dict[str, float],
     default_percentiles: str,
+    use_max_scores: bool,
 ) -> None:
     rbd_values = column_filters.get("RBD") or set()
     if not rbd_values:
@@ -1075,14 +1193,15 @@ def show_filtered_rbd_statistics(
     matched_rows = 0
     for row in rows:
         total_rows += 1
-        if not row_matches(row, column_filters, min_list, max_list):
+        transformed = apply_max_scores(row, use_max_scores)
+        if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
-        rbd = normalize_code(row.get("RBD"))
+        rbd = normalize_code(transformed.get("RBD"))
         if rbd not in stats_by_rbd:
             continue
         for column in stats_columns:
-            value = to_float(row.get(column, ""))
+            value = to_float(transformed.get(column, ""))
             record_stat_value_by_rbd(
                 rbd,
                 column,
@@ -1114,6 +1233,7 @@ def manage_filters(
     sort_keys: List[SortKey],
     default_percentiles: str,
     initial_output_csv: Optional[str],
+    use_max_scores: bool,
 ) -> Tuple[
     Dict[str, set[str]],
     Dict[str, float],
@@ -1121,7 +1241,9 @@ def manage_filters(
     List[str],
     List[SortKey],
     Optional[str],
+    bool,
 ]:
+    base_fieldnames = list(fieldnames)
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
     max_scores = dict(initial_max_scores)
@@ -1143,8 +1265,9 @@ def manage_filters(
             "7. Ver estadísticos\n"
             "8. Ver estadísticos por RBD\n"
             "9. Exportar filtrados a CSV\n"
-            "10. Continuar\n"
-            "11. Terminar programa"
+            "10. Alternar puntajes MAX\n"
+            "11. Continuar\n"
+            "12. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1235,10 +1358,12 @@ def manage_filters(
         elif choice == "6":
             count_filtered_rows(
                 data_path,
+                fieldnames,
                 column_filters,
                 min_scores,
                 max_scores,
                 sort_keys,
+                use_max_scores,
             )
         elif choice == "7":
             show_filtered_statistics(
@@ -1248,6 +1373,7 @@ def manage_filters(
                 min_scores,
                 max_scores,
                 default_percentiles,
+                use_max_scores,
             )
         elif choice == "8":
             show_filtered_rbd_statistics(
@@ -1257,6 +1383,7 @@ def manage_filters(
                 min_scores,
                 max_scores,
                 default_percentiles,
+                use_max_scores,
             )
         elif choice == "9":
             output_csv = prompt_value(
@@ -1271,10 +1398,37 @@ def manage_filters(
                     max_scores,
                     sort_keys,
                     Path(output_csv),
+                    use_max_scores,
                 )
         elif choice == "10":
-            return column_filters, min_scores, max_scores, sort_by, sort_keys, output_csv
+            use_max_scores = not use_max_scores
+            fieldnames = build_max_fieldnames(base_fieldnames, use_max_scores)
+            (
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+            ) = prune_filters_for_fieldnames(
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+                fieldnames,
+            )
+            sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
+            estado = "activado" if use_max_scores else "desactivado"
+            print(f"Modo puntajes MAX {estado}.")
         elif choice == "11":
+            return (
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+                sort_keys,
+                output_csv,
+                use_max_scores,
+            )
+        elif choice == "12":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -1286,7 +1440,13 @@ def collect_interactive_filters(
     fieldnames: List[str],
     data_path: Path,
     maps: CodeMaps,
-) -> Tuple[Dict[str, set[str]], List[ScoreFilter], List[ScoreFilter], List[SortKey]]:
+) -> Tuple[
+    Dict[str, set[str]],
+    List[ScoreFilter],
+    List[ScoreFilter],
+    List[SortKey],
+    bool,
+]:
     print("=== Modo interactivo: análisis de rendición ===")
 
     if prompt_yes_no("¿Deseas ver las columnas disponibles?", default=False):
@@ -1318,6 +1478,7 @@ def collect_interactive_filters(
     args.sort_by = prompt_sort_by(args.sort_by, fieldnames)
     sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
 
+    use_max_scores = False
     (
         column_filters,
         min_scores,
@@ -1325,6 +1486,7 @@ def collect_interactive_filters(
         args.sort_by,
         sort_keys,
         output_csv,
+        use_max_scores,
     ) = manage_filters(
         fieldnames,
         data_path,
@@ -1336,10 +1498,12 @@ def collect_interactive_filters(
         sort_keys,
         args.percentiles,
         args.output_csv,
+        use_max_scores,
     )
 
-    args.count_by = prompt_count_by(args.count_by, fieldnames)
-    args.stats = prompt_stats_columns(args.stats, fieldnames)
+    active_fieldnames = build_max_fieldnames(fieldnames, use_max_scores)
+    args.count_by = prompt_count_by(args.count_by, active_fieldnames)
+    args.stats = prompt_stats_columns(args.stats, active_fieldnames)
     if args.stats and prompt_yes_no("¿Deseas ajustar percentiles?", default=False):
         args.percentiles = prompt_value("Percentiles (separados por coma)", args.percentiles)
 
@@ -1353,7 +1517,7 @@ def collect_interactive_filters(
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
-    return column_filters, min_list, max_list, sort_keys
+    return column_filters, min_list, max_list, sort_keys, use_max_scores
 
 
 def main() -> None:
@@ -1376,10 +1540,15 @@ def main() -> None:
         Path(args.codebook_csv),
     )
 
+    use_max_scores = False
     if args.interactive or len(sys.argv) == 1:
-        column_filters, min_scores, max_scores, sort_keys = collect_interactive_filters(
-            args, fieldnames, data_path, maps
-        )
+        (
+            column_filters,
+            min_scores,
+            max_scores,
+            sort_keys,
+            use_max_scores,
+        ) = collect_interactive_filters(args, fieldnames, data_path, maps)
     else:
         column_filters = {
             "RBD": parse_list_arg(args.rbd),
@@ -1393,11 +1562,12 @@ def main() -> None:
         min_scores = parse_score_filters(args.min_score)
         max_scores = parse_score_filters(args.max_score)
         sort_keys = parse_sort_by_args(args.sort_by, fieldnames)
+    active_fieldnames = build_max_fieldnames(fieldnames, use_max_scores)
     percentiles = parse_percentiles(args.percentiles)
     stats_columns = list(dict.fromkeys(args.stats))
     if args.stats_by_rbd and not stats_columns:
         raise AnalysisError("Debes indicar al menos una columna en --stats para --stats-by-rbd.")
-    invalid_stats = [column for column in stats_columns if column not in fieldnames]
+    invalid_stats = [column for column in stats_columns if column not in active_fieldnames]
     if invalid_stats:
         raise AnalysisError(
             "Columnas inválidas para estadísticas: " + ", ".join(invalid_stats)
@@ -1428,7 +1598,7 @@ def main() -> None:
 
     output_writer = None
     output_handle = None
-    output_fields = list(fieldnames)
+    output_fields = list(active_fieldnames)
     if args.add_labels:
         for label in ["COD_ENS_DESC", "REGION_NOMBRE", "COMUNA_NOMBRE"]:
             if label not in output_fields:
@@ -1448,13 +1618,18 @@ def main() -> None:
             filtered_rows: List[Dict[str, str]] = []
             for row in rows:
                 total_rows += 1
-                if not row_matches(row, column_filters, min_scores, max_scores):
+                transformed = apply_max_scores(row, use_max_scores)
+                if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
-                enriched = add_label_columns(row, maps) if args.add_labels else row
+                enriched = (
+                    add_label_columns(transformed, maps)
+                    if args.add_labels
+                    else transformed
+                )
                 filtered_rows.append(enriched)
                 for column in stats_values:
-                    value = to_float(row.get(column, ""))
+                    value = to_float(transformed.get(column, ""))
                     record_stat_value(
                         column,
                         value,
@@ -1463,10 +1638,10 @@ def main() -> None:
                         stats_zero_counts,
                     )
                 if stats_by_rbd is not None:
-                    rbd = normalize_code(row.get("RBD"))
+                    rbd = normalize_code(transformed.get("RBD"))
                     if rbd in stats_by_rbd:
                         for column in stats_columns:
-                            value = to_float(row.get(column, ""))
+                            value = to_float(transformed.get(column, ""))
                             record_stat_value_by_rbd(
                                 rbd,
                                 column,
@@ -1489,10 +1664,15 @@ def main() -> None:
         else:
             for row in rows:
                 total_rows += 1
-                if not row_matches(row, column_filters, min_scores, max_scores):
+                transformed = apply_max_scores(row, use_max_scores)
+                if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
-                enriched = add_label_columns(row, maps) if args.add_labels else row
+                enriched = (
+                    add_label_columns(transformed, maps)
+                    if args.add_labels
+                    else transformed
+                )
                 if output_writer:
                     output_writer.writerow({key: enriched.get(key, "") for key in output_fields})
                 for column in counts:
@@ -1501,7 +1681,7 @@ def main() -> None:
                         value = label_value(column, value, maps)
                     counts[column][value] += 1
                 for column in stats_values:
-                    value = to_float(row.get(column, ""))
+                    value = to_float(transformed.get(column, ""))
                     record_stat_value(
                         column,
                         value,
@@ -1510,10 +1690,10 @@ def main() -> None:
                         stats_zero_counts,
                     )
                 if stats_by_rbd is not None:
-                    rbd = normalize_code(row.get("RBD"))
+                    rbd = normalize_code(transformed.get("RBD"))
                     if rbd in stats_by_rbd:
                         for column in stats_columns:
-                            value = to_float(row.get(column, ""))
+                            value = to_float(transformed.get(column, ""))
                             record_stat_value_by_rbd(
                                 rbd,
                                 column,
