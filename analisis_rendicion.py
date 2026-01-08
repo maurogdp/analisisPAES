@@ -209,6 +209,12 @@ def parse_sort_by_args(values: Sequence[str], fieldnames: Sequence[str]) -> List
         direction = direction.strip().lower()
         if not column:
             raise AnalysisError(f"Orden inválido '{raw}'. Usa COLUMNA o COLUMNA:asc/desc.")
+        if column.isdigit():
+            idx = int(column)
+            if 1 <= idx <= len(fieldnames):
+                column = fieldnames[idx - 1]
+            else:
+                raise AnalysisError(f"Columna inválida para ordenar: {column}")
         if column not in fieldnames:
             raise AnalysisError(f"Columna inválida para ordenar: {column}")
         if direction not in {"asc", "desc"}:
@@ -347,9 +353,9 @@ def compute_weighted_score(
     row: Dict[str, str],
     weighting: WeightingConfig,
     subject_columns: Dict[str, str],
-) -> Optional[float]:
+) -> Tuple[Optional[float], bool]:
     if not weighting.enabled:
-        return None
+        return None, True
     total = 0.0
     used = False
     for subject in ["nem", "ranking", "clec", "mate1", "mate2"]:
@@ -357,8 +363,8 @@ def compute_weighted_score(
         if weight <= 0:
             continue
         value = to_float(row.get(subject_columns.get(subject, ""), "") or "")
-        if value is None:
-            return None
+        if value is None or value <= 0:
+            return None, False
         total += value * (weight / 100)
         used = True
 
@@ -376,13 +382,13 @@ def compute_weighted_score(
             history_value = to_float(
                 row.get(subject_columns.get("historia", ""), "") or ""
             )
-            if history_value is None:
+            if history_value is None or history_value <= 0:
                 history_value = None
         if science_weight > 0:
             science_value = to_float(
                 row.get(subject_columns.get("ciencias", ""), "") or ""
             )
-            if science_value is None:
+            if science_value is None or science_value <= 0:
                 science_value = None
         candidates = []
         if history_weight > 0 and history_value is not None:
@@ -391,7 +397,7 @@ def compute_weighted_score(
             candidates.append(science_value * (science_weight / 100))
         if history_weight > 0 or science_weight > 0:
             if not candidates:
-                return None
+                return None, False
             total += max(candidates)
             used = True
     else:
@@ -399,22 +405,22 @@ def compute_weighted_score(
             if weight <= 0:
                 continue
             value = to_float(row.get(subject_columns.get(subject, ""), "") or "")
-            if value is None:
-                return None
+            if value is None or value <= 0:
+                return None, False
             total += value * (weight / 100)
             used = True
 
-    return total if used else None
+    return (total if used else None), True
 
 
 def apply_weighted_score(
     row: Dict[str, str],
     weighting: Optional[WeightingConfig],
     subject_columns: Dict[str, str],
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], bool]:
     if not weighting or not weighting.enabled:
-        return row
-    weighted_value = compute_weighted_score(row, weighting, subject_columns)
+        return row, True
+    weighted_value, eligible = compute_weighted_score(row, weighting, subject_columns)
     transformed = dict(row)
     if weighted_value is None:
         transformed[WEIGHTED_SCORE_COLUMN] = ""
@@ -422,7 +428,7 @@ def apply_weighted_score(
         transformed[WEIGHTED_SCORE_COLUMN] = str(int(weighted_value))
     else:
         transformed[WEIGHTED_SCORE_COLUMN] = f"{weighted_value:.2f}"
-    return transformed
+    return transformed, eligible
 
 
 def prune_filters_for_fieldnames(
@@ -1019,8 +1025,16 @@ def prompt_sort_by(existing: List[str], fieldnames: List[str]) -> List[str]:
     cleaned: List[str] = []
     invalid: List[str] = []
     for item in requested:
-        column = item.split(":", 1)[0].strip()
-        if column in fieldnames:
+        column_part, *direction_part = item.split(":", 1)
+        column_part = column_part.strip()
+        direction = f":{direction_part[0].strip()}" if direction_part else ""
+        if column_part.isdigit():
+            idx = int(column_part)
+            if 1 <= idx <= len(fieldnames):
+                cleaned.append(f"{fieldnames[idx - 1]}{direction}")
+            else:
+                invalid.append(item)
+        elif column_part in fieldnames:
             cleaned.append(item)
         else:
             invalid.append(item)
@@ -1220,11 +1234,17 @@ def count_filtered_rows(
     subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
+    excluded_weighting = 0
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
-        transformed = apply_weighted_score(transformed, weighting, subject_columns)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            excluded_weighting += 1
+            continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1254,6 +1274,11 @@ def count_filtered_rows(
         print("\nEncabezados numéricos:")
         for short, original in mapping:
             print(f"- {short} = {original}")
+    if weighting and weighting.enabled:
+        print(
+            "\nEstudiantes excluidos por falta de pruebas para ponderación: "
+            f"{excluded_weighting}"
+        )
 
 
 def export_filtered_rows(
@@ -1273,11 +1298,17 @@ def export_filtered_rows(
     subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
+    excluded_weighting = 0
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
-        transformed = apply_weighted_score(transformed, weighting, subject_columns)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            excluded_weighting += 1
+            continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1293,6 +1324,11 @@ def export_filtered_rows(
     print(f"- Ruta: {output_path}")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros exportados: {matched_rows}")
+    if weighting and weighting.enabled:
+        print(
+            "- Estudiantes excluidos por falta de pruebas para ponderación: "
+            f"{excluded_weighting}"
+        )
 
 
 def show_filtered_statistics(
@@ -1326,10 +1362,16 @@ def show_filtered_statistics(
     subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
+    excluded_weighting = 0
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
-        transformed = apply_weighted_score(transformed, weighting, subject_columns)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            excluded_weighting += 1
+            continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1346,6 +1388,11 @@ def show_filtered_statistics(
     print("\nResumen estadístico con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
+    if weighting and weighting.enabled:
+        print(
+            "- Estudiantes excluidos por falta de pruebas para ponderación: "
+            f"{excluded_weighting}"
+        )
     print_statistics(stats_values, percentiles, stats_totals, stats_zero_counts)
 
 
@@ -1393,10 +1440,16 @@ def show_filtered_rbd_statistics(
     subject_columns = subject_columns_for_weighting(use_max_scores)
     total_rows = 0
     matched_rows = 0
+    excluded_weighting = 0
     for row in rows:
         total_rows += 1
         transformed = apply_max_scores(row, use_max_scores)
-        transformed = apply_weighted_score(transformed, weighting, subject_columns)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            excluded_weighting += 1
+            continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
@@ -1417,6 +1470,11 @@ def show_filtered_rbd_statistics(
     print("\nResumen estadístico por RBD con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
+    if weighting and weighting.enabled:
+        print(
+            "- Estudiantes excluidos por falta de pruebas para ponderación: "
+            f"{excluded_weighting}"
+        )
     print_rbd_statistics(
         stats_by_rbd,
         percentiles,
@@ -1882,6 +1940,7 @@ def main() -> None:
 
     total_rows = 0
     matched_rows = 0
+    excluded_weighting = 0
     subject_columns = subject_columns_for_weighting(use_max_scores)
 
     try:
@@ -1890,9 +1949,12 @@ def main() -> None:
             for row in rows:
                 total_rows += 1
                 transformed = apply_max_scores(row, use_max_scores)
-                transformed = apply_weighted_score(
+                transformed, eligible = apply_weighted_score(
                     transformed, weighting_config, subject_columns
                 )
+                if weighting_config and weighting_config.enabled and not eligible:
+                    excluded_weighting += 1
+                    continue
                 if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
@@ -1939,9 +2001,12 @@ def main() -> None:
             for row in rows:
                 total_rows += 1
                 transformed = apply_max_scores(row, use_max_scores)
-                transformed = apply_weighted_score(
+                transformed, eligible = apply_weighted_score(
                     transformed, weighting_config, subject_columns
                 )
+                if weighting_config and weighting_config.enabled and not eligible:
+                    excluded_weighting += 1
+                    continue
                 if not row_matches(transformed, column_filters, min_scores, max_scores):
                     continue
                 matched_rows += 1
@@ -1986,6 +2051,11 @@ def main() -> None:
     print("Resumen del análisis:")
     print(f"- Total de registros: {total_rows}")
     print(f"- Registros filtrados: {matched_rows}")
+    if weighting_config and weighting_config.enabled:
+        print(
+            "- Estudiantes excluidos por falta de pruebas para ponderación: "
+            f"{excluded_weighting}"
+        )
 
     if counts:
         print_counts(counts)
