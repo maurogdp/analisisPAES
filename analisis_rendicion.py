@@ -1287,21 +1287,6 @@ def prompt_rbd_lookup(maps: CodeMaps) -> None:
             return
         rows = [rbd_info_to_row(rbd, info) for rbd, info in matches]
         print_table(["RBD", "Colegio", "Comuna", "Región"], rows)
-
-
-def display_value(column: str, value: str, maps: CodeMaps, use_labels: bool) -> str:
-    if not use_labels:
-        return value
-    if column == "RBD":
-        info = maps.rbd_info.get(value)
-        return info.name if info and info.name else value
-    if column == "CODIGO_COMUNA":
-        return maps.comunas.get(value, value)
-    if column == "CODIGO_REGION":
-        return maps.regiones.get(value, value)
-    return value
-
-
 def prompt_column_value(
     column: str,
     data_path: Path,
@@ -1830,9 +1815,8 @@ def manage_filters(
             "12. Configurar ponderación\n"
             "13. Eliminar ponderación\n"
             "14. Transformar RBD/colegio\n"
-            "15. Alternar nombres/códigos en salidas\n"
-            "16. Continuar\n"
-            "17. Terminar programa"
+            "15. Continuar\n"
+            "16. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -2050,10 +2034,6 @@ def manage_filters(
         elif choice == "14":
             prompt_rbd_lookup(maps)
         elif choice == "15":
-            display_labels = not display_labels
-            estado = "nombres" if display_labels else "códigos"
-            print(f"Mostrando {estado} en las salidas.")
-        elif choice == "16":
             return (
                 column_filters,
                 min_scores,
@@ -2065,7 +2045,7 @@ def manage_filters(
                 weighting_config,
                 display_labels,
             )
-        elif choice == "17":
+        elif choice == "16":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
