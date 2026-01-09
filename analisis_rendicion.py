@@ -39,6 +39,7 @@ DEFAULT_CODEBOOK = (
     "PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20/"
     "Rinden_Admisión2025/Libro_CódigosADM2025_ArchivoC_Rinden.csv"
 )
+DEFAULT_RBD_COLEGIOS = "rbd_colegios_chile_2021_funcionando_geoportal.csv"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class CodeMaps:
     regiones: Dict[str, str]
     comunas: Dict[str, str]
     value_labels: Dict[str, Dict[str, str]]
+    rbd_info: Dict[str, "RbdInfo"]
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,13 @@ class WeightingConfig:
     weights: Dict[str, float]
     history_science_mode: str
     enabled: bool = False
+
+
+@dataclass(frozen=True)
+class RbdInfo:
+    name: str
+    comuna: str
+    region: str
 
 
 class AnalysisError(Exception):
@@ -518,19 +527,40 @@ def load_codebook(path: Path) -> Dict[str, Dict[str, str]]:
     return mappings
 
 
+def load_rbd_colegios(path: Path) -> Dict[str, RbdInfo]:
+    if not path.exists():
+        return {}
+    dialect = sniff_dialect(path)
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, dialect=dialect)
+        mapping: Dict[str, RbdInfo] = {}
+        for row in reader:
+            rbd = normalize_code(row.get("RBD"))
+            name = normalize_code(row.get("NOM_RBD"))
+            comuna = normalize_code(row.get("NOM_COM_RB"))
+            region = normalize_code(row.get("NOM_REG_RB"))
+            if not rbd:
+                continue
+            mapping[rbd] = RbdInfo(name=name, comuna=comuna, region=region)
+        return mapping
+
+
 def build_code_maps(
     cod_ens_path: Path,
     comunas_path: Path,
     codebook_path: Path,
+    rbd_colegios_path: Path,
 ) -> CodeMaps:
     cod_ens = load_cod_ens(cod_ens_path)
     regiones, comunas = load_comunas_regiones(comunas_path)
     value_labels = load_codebook(codebook_path)
+    rbd_info = load_rbd_colegios(rbd_colegios_path)
     return CodeMaps(
         cod_ens=cod_ens,
         regiones=regiones,
         comunas=comunas,
         value_labels=value_labels,
+        rbd_info=rbd_info,
     )
 
 
@@ -565,6 +595,10 @@ def value_description(column: str, value: str, maps: CodeMaps) -> str:
         return maps.regiones[value]
     if column == "CODIGO_COMUNA" and value in maps.comunas:
         return maps.comunas[value]
+    if column == "RBD" and value in maps.rbd_info:
+        info = maps.rbd_info[value]
+        parts = [part for part in [info.name, info.comuna, info.region] if part]
+        return " - ".join(parts)
     return ""
 
 
@@ -818,6 +852,11 @@ def parse_args() -> argparse.Namespace:
         "--codebook-csv",
         default=DEFAULT_CODEBOOK,
         help="CSV con códigos y descripciones de variables.",
+    )
+    parser.add_argument(
+        "--rbd-colegios-csv",
+        default=DEFAULT_RBD_COLEGIOS,
+        help="CSV con equivalencias de RBD a colegio/comuna/región.",
     )
     parser.add_argument("--rbd", help="Lista de RBD separados por coma.")
     parser.add_argument("--situacion-egreso", help="Lista de situación de egreso.")
@@ -1191,6 +1230,78 @@ def print_column_value_help(
     print_table(["Valor", "Descripción", "Cantidad"], rows)
 
 
+def normalize_text(value: str) -> str:
+    return value.casefold().strip()
+
+
+def rbd_info_to_row(rbd: str, info: RbdInfo) -> List[str]:
+    return [
+        rbd,
+        info.name or "(sin nombre)",
+        info.comuna or "(sin comuna)",
+        info.region or "(sin región)",
+    ]
+
+
+def search_rbd_info(maps: CodeMaps, query: str) -> List[Tuple[str, RbdInfo]]:
+    if not query:
+        return []
+    needle = normalize_text(query)
+    matches = []
+    for rbd, info in maps.rbd_info.items():
+        haystack = " ".join([info.name, info.comuna, info.region]).casefold()
+        if needle in haystack:
+            matches.append((rbd, info))
+    return sorted(matches, key=lambda item: item[0])
+
+
+def prompt_rbd_lookup(maps: CodeMaps) -> None:
+    if not maps.rbd_info:
+        print("No se encontró el archivo de RBD colegios o está vacío.")
+        return
+    options = [
+        "Buscar por RBD",
+        "Buscar por nombre/comuna/región",
+        "Volver",
+    ]
+    selection = prompt_choice("Transformar RBD ↔ colegio:", options, default=1)
+    if selection == 1:
+        raw = input("Ingresa RBD (separados por coma): ").strip()
+        if not raw:
+            return
+        rows = []
+        for rbd in [item.strip() for item in raw.split(",") if item.strip()]:
+            info = maps.rbd_info.get(rbd)
+            if info:
+                rows.append(rbd_info_to_row(rbd, info))
+            else:
+                rows.append([rbd, "(no encontrado)", "-", "-"])
+        print_table(["RBD", "Colegio", "Comuna", "Región"], rows)
+    elif selection == 2:
+        query = input("Ingresa nombre/comuna/región: ").strip()
+        if not query:
+            return
+        matches = search_rbd_info(maps, query)
+        if not matches:
+            print("No se encontraron colegios con ese criterio.")
+            return
+        rows = [rbd_info_to_row(rbd, info) for rbd, info in matches]
+        print_table(["RBD", "Colegio", "Comuna", "Región"], rows)
+
+
+def display_value(column: str, value: str, maps: CodeMaps, use_labels: bool) -> str:
+    if not use_labels:
+        return value
+    if column == "RBD":
+        info = maps.rbd_info.get(value)
+        return info.name if info and info.name else value
+    if column == "CODIGO_COMUNA":
+        return maps.comunas.get(value, value)
+    if column == "CODIGO_REGION":
+        return maps.regiones.get(value, value)
+    return value
+
+
 def prompt_column_value(
     column: str,
     data_path: Path,
@@ -1256,16 +1367,19 @@ def prompt_ranking_limit() -> Optional[int]:
     return None
 
 
-def calculate_row_value(row: Dict[str, str], columns: List[str]) -> Optional[float]:
+def evaluate_row_value(
+    row: Dict[str, str],
+    columns: List[str],
+) -> Tuple[Optional[float], bool]:
     values: List[float] = []
     for column in columns:
         value = to_float(row.get(column, ""))
-        if value is None:
-            return None
+        if value is None or value <= 0:
+            return None, False
         values.append(value)
     if not values:
-        return None
-    return mean(values)
+        return None, False
+    return mean(values), True
 
 
 def calculate_mode(values: List[float]) -> Optional[float]:
@@ -1297,6 +1411,8 @@ def count_filtered_rows(
     sort_keys: Sequence[SortKey],
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
+    display_labels: bool,
+    maps: CodeMaps,
 ) -> None:
     _, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
@@ -1338,7 +1454,11 @@ def count_filtered_rows(
     headers = ["#"] + numbered
     rows_table = []
     for index, row in enumerate(filtered_rows, start=1):
-        rows_table.append([str(index)] + [row.get(col, "") for col in fieldnames])
+        row_values = [
+            display_value(col, row.get(col, ""), maps, display_labels)
+            for col in fieldnames
+        ]
+        rows_table.append([str(index)] + row_values)
     print_table(headers, rows_table)
     if mapping:
         print("\nEncabezados numéricos:")
@@ -1562,6 +1682,7 @@ def show_filtered_ranking(
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
     maps: CodeMaps,
+    display_labels: bool,
 ) -> None:
     grouping_column = prompt_column(fieldnames)
     value_columns = prompt_ranking_value_columns(fieldnames)
@@ -1576,6 +1697,7 @@ def show_filtered_ranking(
     subject_columns = subject_columns_for_weighting(use_max_scores)
 
     values_by_group: Dict[str, List[float]] = {}
+    excluded_by_group: Dict[str, int] = {}
     _, rows = read_csv_rows(data_path)
     for row in rows:
         transformed = apply_max_scores(row, use_max_scores)
@@ -1586,10 +1708,11 @@ def show_filtered_ranking(
             continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
-        value = calculate_row_value(transformed, value_columns)
-        if value is None:
-            continue
         group_value = normalize_code(transformed.get(grouping_column))
+        value, eligible_for_ranking = evaluate_row_value(transformed, value_columns)
+        if not eligible_for_ranking:
+            excluded_by_group[group_value] = excluded_by_group.get(group_value, 0) + 1
+            continue
         values_by_group.setdefault(group_value, []).append(value)
 
     if not values_by_group:
@@ -1612,20 +1735,31 @@ def show_filtered_ranking(
         else:
             metric_value = pstdev(values) if len(values) > 1 else 0.0
         description = label_value(grouping_column, group, maps)
+        group_display = display_value(grouping_column, group, maps, display_labels)
+        description_display = description or ""
+        if display_labels and grouping_column in {"RBD", "CODIGO_COMUNA", "CODIGO_REGION"}:
+            description_display = group or ""
         ranking_rows.append(
             [
-                group or "(vacío)",
-                description or "",
+                group_display or "(vacío)",
+                description_display,
                 len(values),
+                excluded_by_group.get(group, 0),
                 metric_value,
             ]
         )
 
-    ranking_rows.sort(key=lambda row: row[3], reverse=order_desc)
+    ranking_rows.sort(key=lambda row: row[4], reverse=order_desc)
     if limit:
         ranking_rows = ranking_rows[:limit]
 
-    headers = ["Grupo", "Descripción", "N", metric_label(metric, value_columns)]
+    headers = [
+        "Grupo",
+        "Descripción",
+        "Considerados",
+        "Excluidos",
+        metric_label(metric, value_columns),
+    ]
     formatted_rows = []
     for index, row in enumerate(ranking_rows, start=1):
         formatted_rows.append(
@@ -1634,7 +1768,8 @@ def show_filtered_ranking(
                 row[0],
                 row[1],
                 str(row[2]),
-                f"{row[3]:.2f}",
+                str(row[3]),
+                f"{row[4]:.2f}",
             ]
         )
     print("\nRanking con filtros actuales:")
@@ -1654,6 +1789,7 @@ def manage_filters(
     initial_output_csv: Optional[str],
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
+    display_labels: bool,
 ) -> Tuple[
     Dict[str, set[str]],
     Dict[str, float],
@@ -1663,6 +1799,7 @@ def manage_filters(
     Optional[str],
     bool,
     Optional[WeightingConfig],
+    bool,
 ]:
     base_fieldnames = list(fieldnames)
     column_filters = dict(initial_column_filters)
@@ -1692,8 +1829,10 @@ def manage_filters(
             "11. Alternar puntajes MAX\n"
             "12. Configurar ponderación\n"
             "13. Eliminar ponderación\n"
-            "14. Continuar\n"
-            "15. Terminar programa"
+            "14. Transformar RBD/colegio\n"
+            "15. Alternar nombres/códigos en salidas\n"
+            "16. Continuar\n"
+            "17. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1791,6 +1930,8 @@ def manage_filters(
                 sort_keys,
                 use_max_scores,
                 weighting_config,
+                display_labels,
+                maps,
             )
         elif choice == "7":
             show_filtered_statistics(
@@ -1824,6 +1965,7 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
                 maps,
+                display_labels,
             )
         elif choice == "10":
             output_csv = prompt_value(
@@ -1906,6 +2048,12 @@ def manage_filters(
             else:
                 print("No hay ponderación activa para eliminar.")
         elif choice == "14":
+            prompt_rbd_lookup(maps)
+        elif choice == "15":
+            display_labels = not display_labels
+            estado = "nombres" if display_labels else "códigos"
+            print(f"Mostrando {estado} en las salidas.")
+        elif choice == "16":
             return (
                 column_filters,
                 min_scores,
@@ -1915,8 +2063,9 @@ def manage_filters(
                 output_csv,
                 use_max_scores,
                 weighting_config,
+                display_labels,
             )
-        elif choice == "15":
+        elif choice == "17":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -1935,6 +2084,7 @@ def collect_interactive_filters(
     List[SortKey],
     bool,
     Optional[WeightingConfig],
+    bool,
 ]:
     print("=== Modo interactivo: análisis de rendición ===")
 
@@ -1978,6 +2128,7 @@ def collect_interactive_filters(
         output_csv,
         use_max_scores,
         weighting_config,
+        display_labels,
     ) = manage_filters(
         fieldnames,
         data_path,
@@ -1991,6 +2142,7 @@ def collect_interactive_filters(
         args.output_csv,
         use_max_scores,
         weighting_config,
+        False,
     )
 
     active_fieldnames = build_active_fieldnames(
@@ -2011,7 +2163,15 @@ def collect_interactive_filters(
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
-    return column_filters, min_list, max_list, sort_keys, use_max_scores, weighting_config
+    return (
+        column_filters,
+        min_list,
+        max_list,
+        sort_keys,
+        use_max_scores,
+        weighting_config,
+        display_labels,
+    )
 
 
 def main() -> None:
@@ -2032,10 +2192,12 @@ def main() -> None:
         Path(args.cod_ens_csv),
         Path(args.comunas_csv),
         Path(args.codebook_csv),
+        Path(args.rbd_colegios_csv),
     )
 
     use_max_scores = False
     weighting_config = None
+    display_labels = False
     if args.interactive or len(sys.argv) == 1:
         (
             column_filters,
@@ -2044,6 +2206,7 @@ def main() -> None:
             sort_keys,
             use_max_scores,
             weighting_config,
+            display_labels,
         ) = collect_interactive_filters(args, fieldnames, data_path, maps)
     else:
         column_filters = {
