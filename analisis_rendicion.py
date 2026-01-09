@@ -70,6 +70,15 @@ class WeightingConfig:
     enabled: bool = False
 
 
+@dataclass
+class RankingConfig:
+    grouping_column: str
+    value_columns: List[str]
+    metric: str
+    order_desc: bool
+    limit: Optional[int]
+
+
 @dataclass(frozen=True)
 class RbdInfo:
     name: str
@@ -1333,7 +1342,9 @@ def prompt_ranking_metric() -> str:
         "Moda",
         "Desv. Est.",
     ]
-    selection = prompt_choice("Selecciona la métrica para el ranking:", options, default=1)
+    selection = prompt_choice(
+        "Selecciona la métrica con la que se ordenará el ranking:", options, default=1
+    )
     return {1: "mean", 2: "median", 3: "mode", 4: "stdev"}[selection]
 
 
@@ -1342,7 +1353,9 @@ def prompt_ranking_value_columns(fieldnames: List[str]) -> List[str]:
         "Analizar una sola columna",
         "Promedio entre varias columnas",
     ]
-    selection = prompt_choice("¿Qué deseas analizar?", options, default=1)
+    selection = prompt_choice(
+        "¿Qué valores deseas comparar dentro de cada grupo?", options, default=1
+    )
     if selection == 1:
         return [prompt_column(fieldnames)]
     columns = prompt_stats_columns([], fieldnames)
@@ -1397,6 +1410,102 @@ def metric_label(metric: str, columns: List[str]) -> str:
         "stdev": f"Desv. Est. {column_label}",
     }
     return labels.get(metric, column_label)
+
+
+def summarize_ranking(config: Optional[RankingConfig]) -> None:
+    if not config:
+        print("- Ranking: (no configurado)")
+        return
+    value_label = (
+        config.value_columns[0]
+        if len(config.value_columns) == 1
+        else "Promedio columnas"
+    )
+    order_label = "desc" if config.order_desc else "asc"
+    limit_label = "sin límite" if config.limit is None else str(config.limit)
+    print(
+        "- Ranking: "
+        f"grupo {config.grouping_column}, "
+        f"comparación {value_label}, "
+        f"métrica {metric_label(config.metric, config.value_columns)}, "
+        f"orden {order_label}, "
+        f"tope {limit_label}"
+    )
+
+
+def prompt_ranking_config(fieldnames: List[str]) -> Optional[RankingConfig]:
+    print("\nConfiguración de ranking")
+    print(
+        "Definirás un ranking que agrupa registros por una columna (por ejemplo RBD "
+        "o CODIGO_REGION) y compara puntajes dentro de cada grupo."
+    )
+    print(
+        "Luego elegirás qué puntaje(s) comparar y la métrica con la que se ordenará."
+    )
+    grouping_column = prompt_column(fieldnames)
+    value_columns = prompt_ranking_value_columns(fieldnames)
+    if not value_columns:
+        return None
+    metric = prompt_ranking_metric()
+    order_desc = prompt_yes_no("¿Ordenar de mayor a menor?", default=True)
+    limit = prompt_ranking_limit()
+    return RankingConfig(
+        grouping_column=grouping_column,
+        value_columns=value_columns,
+        metric=metric,
+        order_desc=order_desc,
+        limit=limit,
+    )
+
+
+def update_ranking_config(
+    config: Optional[RankingConfig], fieldnames: List[str]
+) -> Optional[RankingConfig]:
+    if not config:
+        return prompt_ranking_config(fieldnames)
+    options = [
+        "Cambiar grupo de comparación",
+        "Cambiar valores de comparación",
+        "Cambiar métrica",
+        "Cambiar orden/límite",
+        "Reconfigurar todo",
+        "Volver",
+    ]
+    selection = prompt_choice("¿Qué deseas ajustar del ranking?", options, default=1)
+    if selection == 1:
+        config.grouping_column = prompt_column(fieldnames)
+    elif selection == 2:
+        value_columns = prompt_ranking_value_columns(fieldnames)
+        if value_columns:
+            config.value_columns = value_columns
+    elif selection == 3:
+        config.metric = prompt_ranking_metric()
+    elif selection == 4:
+        config.order_desc = prompt_yes_no("¿Ordenar de mayor a menor?", default=True)
+        config.limit = prompt_ranking_limit()
+    elif selection == 5:
+        return prompt_ranking_config(fieldnames)
+    return config
+
+
+def validate_ranking_config(
+    config: Optional[RankingConfig], fieldnames: List[str]
+) -> Optional[RankingConfig]:
+    if not config:
+        return None
+    missing = []
+    if config.grouping_column not in fieldnames:
+        missing.append(config.grouping_column)
+    for column in config.value_columns:
+        if column not in fieldnames:
+            missing.append(column)
+    if missing:
+        print(
+            "El ranking se eliminó porque ya no existen estas columnas: "
+            + ", ".join(sorted(set(missing)))
+        )
+        return None
+    return config
 
 
 def count_filtered_rows(
@@ -1680,14 +1789,43 @@ def show_filtered_ranking(
     weighting: Optional[WeightingConfig],
     maps: CodeMaps,
     display_labels: bool,
-) -> None:
-    grouping_column = prompt_column(fieldnames)
-    value_columns = prompt_ranking_value_columns(fieldnames)
-    if not value_columns:
-        return
-    metric = prompt_ranking_metric()
-    order_desc = prompt_yes_no("¿Ordenar de mayor a menor?", default=True)
-    limit = prompt_ranking_limit()
+) -> Optional[RankingConfig]:
+    return show_filtered_ranking_with_config(
+        data_path,
+        fieldnames,
+        column_filters,
+        min_scores,
+        max_scores,
+        use_max_scores,
+        weighting,
+        maps,
+        display_labels,
+        None,
+    )
+
+
+def show_filtered_ranking_with_config(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+    maps: CodeMaps,
+    display_labels: bool,
+    config: Optional[RankingConfig],
+) -> Optional[RankingConfig]:
+    if config is None:
+        config = prompt_ranking_config(fieldnames)
+        if not config:
+            return None
+
+    grouping_column = config.grouping_column
+    value_columns = config.value_columns
+    metric = config.metric
+    order_desc = config.order_desc
+    limit = config.limit
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
@@ -1771,6 +1909,7 @@ def show_filtered_ranking(
         )
     print("\nRanking con filtros actuales:")
     print_table(["#", *headers], formatted_rows)
+    return config
 
 
 def manage_filters(
@@ -1806,9 +1945,32 @@ def manage_filters(
     output_csv = initial_output_csv
     weighting_config = weighting
     value_cache: Dict[str, Counter] = {}
+    ranking_config: Optional[RankingConfig] = None
+    view_mode = "datos"
+
+    def refresh_ranking_if_visible() -> None:
+        nonlocal ranking_config
+        if view_mode != "ranking":
+            return
+        if not ranking_config:
+            print("No hay ranking configurado.")
+            return
+        ranking_config = show_filtered_ranking_with_config(
+            data_path,
+            fieldnames,
+            column_filters,
+            min_scores,
+            max_scores,
+            use_max_scores,
+            weighting_config,
+            maps,
+            display_labels,
+            ranking_config,
+        )
     while True:
         summarize_filters(column_filters, min_scores, max_scores)
         summarize_weighting(weighting_config)
+        summarize_ranking(ranking_config)
         if sort_by:
             print(f"- Orden actual: {', '.join(sort_by)}")
         print(
@@ -1821,14 +1983,16 @@ def manage_filters(
             "6. Mostrar datos actuales\n"
             "7. Ver estadísticos\n"
             "8. Ver estadísticos por RBD\n"
-            "9. Ver ranking\n"
-            "10. Exportar filtrados a CSV\n"
-            "11. Alternar puntajes MAX\n"
-            "12. Configurar ponderación\n"
-            "13. Eliminar ponderación\n"
-            "14. Transformar RBD/colegio\n"
-            "15. Continuar\n"
-            "16. Terminar programa"
+            "9. Configurar/modificar ranking\n"
+            "10. Ver ranking\n"
+            "11. Eliminar ranking\n"
+            "12. Exportar filtrados a CSV\n"
+            "13. Alternar puntajes MAX\n"
+            "14. Configurar ponderación\n"
+            "15. Eliminar ponderación\n"
+            "16. Transformar RBD/colegio\n"
+            "17. Continuar\n"
+            "18. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1854,6 +2018,7 @@ def manage_filters(
                     max_scores[column] = threshold
             else:
                 print("Tipo inválido.")
+            refresh_ranking_if_visible()
         elif choice == "2":
             index = build_filter_index(column_filters, min_scores, max_scores)
             if not index:
@@ -1882,6 +2047,7 @@ def manage_filters(
                 threshold = prompt_threshold(column)
                 if threshold is not None:
                     max_scores[column] = threshold
+            refresh_ranking_if_visible()
         elif choice == "3":
             index = build_filter_index(column_filters, min_scores, max_scores)
             if not index:
@@ -1904,11 +2070,13 @@ def manage_filters(
                 min_scores.pop(column, None)
             elif kind == "max":
                 max_scores.pop(column, None)
+            refresh_ranking_if_visible()
         elif choice == "4":
             if prompt_yes_no("¿Seguro que deseas reiniciar los filtros?", default=False):
                 column_filters.clear()
                 min_scores.clear()
                 max_scores.clear()
+                refresh_ranking_if_visible()
         elif choice == "5":
             sort_by = prompt_sort_by([], fieldnames)
             sort_keys = parse_sort_by_args(sort_by, fieldnames)
@@ -1917,6 +2085,7 @@ def manage_filters(
             else:
                 print("Orden limpiado; se usará el orden del archivo.")
         elif choice == "6":
+            view_mode = "datos"
             count_filtered_rows(
                 data_path,
                 fieldnames,
@@ -1952,7 +2121,24 @@ def manage_filters(
                 weighting_config,
             )
         elif choice == "9":
-            show_filtered_ranking(
+            ranking_config = update_ranking_config(ranking_config, fieldnames)
+            if ranking_config:
+                view_mode = "ranking"
+                ranking_config = show_filtered_ranking_with_config(
+                    data_path,
+                    fieldnames,
+                    column_filters,
+                    min_scores,
+                    max_scores,
+                    use_max_scores,
+                    weighting_config,
+                    maps,
+                    display_labels,
+                    ranking_config,
+                )
+        elif choice == "10":
+            view_mode = "ranking"
+            ranking_config = show_filtered_ranking_with_config(
                 data_path,
                 fieldnames,
                 column_filters,
@@ -1962,8 +2148,17 @@ def manage_filters(
                 weighting_config,
                 maps,
                 display_labels,
+                ranking_config,
             )
-        elif choice == "10":
+        elif choice == "11":
+            if ranking_config:
+                ranking_config = None
+                if view_mode == "ranking":
+                    view_mode = "datos"
+                print("Ranking eliminado.")
+            else:
+                print("No hay ranking configurado.")
+        elif choice == "12":
             output_csv = prompt_value(
                 "Ruta del CSV de salida", output_csv or "filtrados.csv"
             )
@@ -1979,7 +2174,7 @@ def manage_filters(
                     use_max_scores,
                     weighting_config,
                 )
-        elif choice == "11":
+        elif choice == "13":
             use_max_scores = not use_max_scores
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -1999,7 +2194,9 @@ def manage_filters(
             sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
             estado = "activado" if use_max_scores else "desactivado"
             print(f"Modo puntajes MAX {estado}.")
-        elif choice == "12":
+            ranking_config = validate_ranking_config(ranking_config, fieldnames)
+            refresh_ranking_if_visible()
+        elif choice == "14":
             weighting_config = prompt_weighting(weighting_config, use_max_scores)
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -2017,7 +2214,9 @@ def manage_filters(
                 fieldnames,
             )
             sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
-        elif choice == "13":
+            ranking_config = validate_ranking_config(ranking_config, fieldnames)
+            refresh_ranking_if_visible()
+        elif choice == "15":
             if weighting_config and weighting_config.enabled:
                 weighting_config = WeightingConfig(
                     weights=weighting_config.weights,
@@ -2043,9 +2242,11 @@ def manage_filters(
                 print("Ponderación eliminada.")
             else:
                 print("No hay ponderación activa para eliminar.")
-        elif choice == "14":
+            ranking_config = validate_ranking_config(ranking_config, fieldnames)
+            refresh_ranking_if_visible()
+        elif choice == "16":
             prompt_rbd_lookup(maps)
-        elif choice == "15":
+        elif choice == "17":
             return (
                 column_filters,
                 min_scores,
@@ -2057,7 +2258,7 @@ def manage_filters(
                 weighting_config,
                 display_labels,
             )
-        elif choice == "16":
+        elif choice == "18":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
