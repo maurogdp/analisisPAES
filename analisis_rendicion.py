@@ -77,6 +77,7 @@ class RankingConfig:
     metric: str
     order_desc: bool
     limit: Optional[int]
+    include_dependency_positions: bool = False
 
 
 @dataclass(frozen=True)
@@ -1401,6 +1402,188 @@ def calculate_mode(values: List[float]) -> Optional[float]:
     return min(candidates)
 
 
+RBD_POSITION_FILTERED = "POS_RBD_FILTRADO"
+RBD_POSITION_NATIONAL = "POS_RBD_NACIONAL"
+RBD_POSITION_REGIONAL = "POS_RBD_REGIONAL"
+RBD_POSITION_COMUNAL = "POS_RBD_COMUNAL"
+RBD_POSITION_DEPENDENCY = "POS_RBD_DEPENDENCIA"
+
+
+def metric_value_for_group(values: List[float], metric: str) -> Optional[float]:
+    if not values:
+        return None
+    if metric == "mean":
+        return mean(values)
+    if metric == "median":
+        return median(values)
+    if metric == "mode":
+        return calculate_mode(values)
+    return pstdev(values) if len(values) > 1 else 0.0
+
+
+def update_rbd_metadata(
+    metadata: Dict[str, Dict[str, str]],
+    rbd: str,
+    row: Dict[str, str],
+    maps: CodeMaps,
+) -> None:
+    if rbd not in metadata:
+        metadata[rbd] = {"region": "", "comuna": "", "dependencia": ""}
+    info = metadata[rbd]
+    if not info["region"]:
+        info["region"] = normalize_code(row.get("CODIGO_REGION", ""))
+    if not info["comuna"]:
+        info["comuna"] = normalize_code(row.get("CODIGO_COMUNA", ""))
+    if not info["dependencia"]:
+        info["dependencia"] = normalize_code(row.get("GRUPO_DEPENDENCIA", ""))
+    if maps.rbd_info and rbd in maps.rbd_info:
+        rbd_info = maps.rbd_info[rbd]
+        if not info["region"]:
+            info["region"] = normalize_code(rbd_info.region)
+        if not info["comuna"]:
+            info["comuna"] = normalize_code(rbd_info.comuna)
+
+
+def compute_positions(
+    metrics_by_rbd: Dict[str, float], order_desc: bool
+) -> Dict[str, int]:
+    if order_desc:
+        items = sorted(metrics_by_rbd.items(), key=lambda item: (-item[1], item[0]))
+    else:
+        items = sorted(metrics_by_rbd.items(), key=lambda item: (item[1], item[0]))
+    return {rbd: index for index, (rbd, _) in enumerate(items, start=1)}
+
+
+def compute_group_positions(
+    metrics_by_rbd: Dict[str, float],
+    group_by_rbd: Dict[str, str],
+    order_desc: bool,
+) -> Dict[str, int]:
+    grouped: Dict[str, List[Tuple[str, float]]] = {}
+    for rbd, metric in metrics_by_rbd.items():
+        group = group_by_rbd.get(rbd, "")
+        if not group:
+            continue
+        grouped.setdefault(group, []).append((rbd, metric))
+    positions: Dict[str, int] = {}
+    for items in grouped.values():
+        if order_desc:
+            items_sorted = sorted(items, key=lambda item: (-item[1], item[0]))
+        else:
+            items_sorted = sorted(items, key=lambda item: (item[1], item[0]))
+        for index, (rbd, _) in enumerate(items_sorted, start=1):
+            positions[rbd] = index
+    return positions
+
+
+def build_rbd_position_columns(config: RankingConfig) -> List[str]:
+    columns = [
+        RBD_POSITION_FILTERED,
+        RBD_POSITION_NATIONAL,
+        RBD_POSITION_REGIONAL,
+        RBD_POSITION_COMUNAL,
+    ]
+    if config.include_dependency_positions:
+        columns.append(RBD_POSITION_DEPENDENCY)
+    return columns
+
+
+def build_rbd_positions(
+    data_path: Path,
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+    config: RankingConfig,
+    maps: CodeMaps,
+) -> Dict[str, Dict[str, int]]:
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    subject_columns = subject_columns_for_weighting(use_max_scores)
+    values_by_rbd_all: Dict[str, List[float]] = {}
+    values_by_rbd_filtered: Dict[str, List[float]] = {}
+    metadata_by_rbd: Dict[str, Dict[str, str]] = {}
+    _, rows = read_csv_rows(data_path)
+    for row in rows:
+        transformed = apply_max_scores(row, use_max_scores)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            continue
+        rbd = normalize_code(transformed.get("RBD"))
+        if not rbd:
+            continue
+        update_rbd_metadata(metadata_by_rbd, rbd, transformed, maps)
+        value, eligible_for_ranking = evaluate_row_value(
+            transformed, config.value_columns
+        )
+        if not eligible_for_ranking:
+            continue
+        values_by_rbd_all.setdefault(rbd, []).append(value)
+        if row_matches(transformed, column_filters, min_list, max_list):
+            values_by_rbd_filtered.setdefault(rbd, []).append(value)
+    metrics_all: Dict[str, float] = {}
+    for rbd, values in values_by_rbd_all.items():
+        metric_value = metric_value_for_group(values, config.metric)
+        if metric_value is not None:
+            metrics_all[rbd] = metric_value
+    metrics_filtered: Dict[str, float] = {}
+    for rbd, values in values_by_rbd_filtered.items():
+        metric_value = metric_value_for_group(values, config.metric)
+        if metric_value is not None:
+            metrics_filtered[rbd] = metric_value
+    positions_filtered = compute_positions(metrics_filtered, config.order_desc)
+    positions_national = compute_positions(metrics_all, config.order_desc)
+    region_by_rbd = {rbd: info.get("region", "") for rbd, info in metadata_by_rbd.items()}
+    comuna_by_rbd = {rbd: info.get("comuna", "") for rbd, info in metadata_by_rbd.items()}
+    dependencia_by_rbd = {
+        rbd: info.get("dependencia", "") for rbd, info in metadata_by_rbd.items()
+    }
+    positions_regional = compute_group_positions(
+        metrics_all, region_by_rbd, config.order_desc
+    )
+    positions_comunal = compute_group_positions(
+        metrics_all, comuna_by_rbd, config.order_desc
+    )
+    positions_dependency: Dict[str, int] = {}
+    if config.include_dependency_positions:
+        positions_dependency = compute_group_positions(
+            metrics_all, dependencia_by_rbd, config.order_desc
+        )
+    all_rbds = set(metrics_all) | set(metrics_filtered)
+    positions_by_rbd: Dict[str, Dict[str, int]] = {}
+    for rbd in all_rbds:
+        positions_by_rbd[rbd] = {
+            RBD_POSITION_FILTERED: positions_filtered.get(rbd, 0),
+            RBD_POSITION_NATIONAL: positions_national.get(rbd, 0),
+            RBD_POSITION_REGIONAL: positions_regional.get(rbd, 0),
+            RBD_POSITION_COMUNAL: positions_comunal.get(rbd, 0),
+        }
+        if config.include_dependency_positions:
+            positions_by_rbd[rbd][RBD_POSITION_DEPENDENCY] = positions_dependency.get(
+                rbd, 0
+            )
+    return positions_by_rbd
+
+
+def apply_rbd_positions(
+    row: Dict[str, str],
+    positions_by_rbd: Dict[str, Dict[str, int]],
+    position_columns: Sequence[str],
+) -> None:
+    if not position_columns:
+        return
+    rbd = normalize_code(row.get("RBD"))
+    if not rbd:
+        return
+    positions = positions_by_rbd.get(rbd, {})
+    for column in position_columns:
+        position = positions.get(column, 0)
+        row[column] = str(position) if position else ""
+
+
 def metric_label(metric: str, columns: List[str]) -> str:
     column_label = columns[0] if len(columns) == 1 else "Promedio columnas"
     labels = {
@@ -1423,12 +1606,15 @@ def summarize_ranking(config: Optional[RankingConfig]) -> None:
     )
     order_label = "desc" if config.order_desc else "asc"
     limit_label = "sin límite" if config.limit is None else str(config.limit)
+    dependency_label = ""
+    if config.grouping_column == "RBD" and config.include_dependency_positions:
+        dependency_label = ", posición por dependencia"
     print(
         "- Ranking: "
         f"grupo {config.grouping_column}, "
         f"comparación {value_label}, "
         f"métrica {metric_label(config.metric, config.value_columns)}, "
-        f"orden {order_label}, "
+        f"orden {order_label}{dependency_label}, "
         f"tope {limit_label}"
     )
 
@@ -1443,6 +1629,11 @@ def prompt_ranking_config(fieldnames: List[str]) -> Optional[RankingConfig]:
         "Luego elegirás qué puntaje(s) comparar y la métrica con la que se ordenará."
     )
     grouping_column = prompt_column(fieldnames)
+    include_dependency_positions = False
+    if grouping_column == "RBD":
+        include_dependency_positions = prompt_yes_no(
+            "¿Incluir posición relativa por dependencia?", default=False
+        )
     value_columns = prompt_ranking_value_columns(fieldnames)
     if not value_columns:
         return None
@@ -1455,6 +1646,7 @@ def prompt_ranking_config(fieldnames: List[str]) -> Optional[RankingConfig]:
         metric=metric,
         order_desc=order_desc,
         limit=limit,
+        include_dependency_positions=include_dependency_positions,
     )
 
 
@@ -1468,12 +1660,19 @@ def update_ranking_config(
         "Cambiar valores de comparación",
         "Cambiar métrica",
         "Cambiar orden/límite",
+        "Alternar posición por dependencia",
         "Reconfigurar todo",
         "Volver",
     ]
     selection = prompt_choice("¿Qué deseas ajustar del ranking?", options, default=1)
     if selection == 1:
         config.grouping_column = prompt_column(fieldnames)
+        if config.grouping_column != "RBD":
+            config.include_dependency_positions = False
+        else:
+            config.include_dependency_positions = prompt_yes_no(
+                "¿Incluir posición relativa por dependencia?", default=False
+            )
     elif selection == 2:
         value_columns = prompt_ranking_value_columns(fieldnames)
         if value_columns:
@@ -1484,6 +1683,11 @@ def update_ranking_config(
         config.order_desc = prompt_yes_no("¿Ordenar de mayor a menor?", default=True)
         config.limit = prompt_ranking_limit()
     elif selection == 5:
+        if config.grouping_column == "RBD":
+            config.include_dependency_positions = not config.include_dependency_positions
+        else:
+            print("La posición por dependencia solo aplica cuando el grupo es RBD.")
+    elif selection == 6:
         return prompt_ranking_config(fieldnames)
     return config
 
@@ -1519,7 +1723,22 @@ def count_filtered_rows(
     weighting: Optional[WeightingConfig],
     display_labels: bool,
     maps: CodeMaps,
+    ranking_config: Optional[RankingConfig],
 ) -> None:
+    position_columns: List[str] = []
+    positions_by_rbd: Dict[str, Dict[str, int]] = {}
+    if ranking_config and ranking_config.grouping_column == "RBD":
+        position_columns = build_rbd_position_columns(ranking_config)
+        positions_by_rbd = build_rbd_positions(
+            data_path,
+            column_filters,
+            min_scores,
+            max_scores,
+            use_max_scores,
+            weighting,
+            ranking_config,
+            maps,
+        )
     _, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
@@ -1540,6 +1759,7 @@ def count_filtered_rows(
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
+        apply_rbd_positions(transformed, positions_by_rbd, position_columns)
         filtered_rows.append(transformed)
     print("\nResumen con filtros actuales:")
     print(f"- Total de registros: {total_rows}")
@@ -1556,13 +1776,14 @@ def count_filtered_rows(
         if sort_keys
         else "\nFilas filtradas (ordenadas por el archivo):"
     )
-    numbered, mapping = build_numbered_headers(fieldnames)
+    display_fieldnames = fieldnames + position_columns
+    numbered, mapping = build_numbered_headers(display_fieldnames)
     headers = ["#"] + numbered
     rows_table = []
     for index, row in enumerate(filtered_rows, start=1):
         row_values = [
             display_value(col, row.get(col, ""), maps, display_labels)
-            for col in fieldnames
+            for col in display_fieldnames
         ]
         rows_table.append([str(index)] + row_values)
     print_table(headers, rows_table)
@@ -1587,11 +1808,27 @@ def export_filtered_rows(
     output_path: Path,
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
+    ranking_config: Optional[RankingConfig],
+    maps: CodeMaps,
 ) -> None:
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     _, rows = read_csv_rows(data_path)
     subject_columns = subject_columns_for_weighting(use_max_scores)
+    position_columns: List[str] = []
+    positions_by_rbd: Dict[str, Dict[str, int]] = {}
+    if ranking_config and ranking_config.grouping_column == "RBD":
+        position_columns = build_rbd_position_columns(ranking_config)
+        positions_by_rbd = build_rbd_positions(
+            data_path,
+            column_filters,
+            min_scores,
+            max_scores,
+            use_max_scores,
+            weighting,
+            ranking_config,
+            maps,
+        )
     total_rows = 0
     matched_rows = 0
     excluded_weighting = 0
@@ -1608,14 +1845,16 @@ def export_filtered_rows(
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         matched_rows += 1
+        apply_rbd_positions(transformed, positions_by_rbd, position_columns)
         filtered_rows.append(transformed)
     if sort_keys:
         sort_rows(filtered_rows, sort_keys)
+    output_fieldnames = fieldnames + position_columns
     with output_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=output_fieldnames)
         writer.writeheader()
         for row in filtered_rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})
+            writer.writerow({key: row.get(key, "") for key in output_fieldnames})
     print("\nExportación completada:")
     print(f"- Ruta: {output_path}")
     print(f"- Total de registros: {total_rows}")
@@ -1860,17 +2099,9 @@ def show_filtered_ranking_with_config(
     for group, values in values_by_group.items():
         if not values:
             continue
-        if metric == "mean":
-            metric_value = mean(values)
-        elif metric == "median":
-            metric_value = median(values)
-        elif metric == "mode":
-            mode_value = calculate_mode(values)
-            if mode_value is None:
-                continue
-            metric_value = mode_value
-        else:
-            metric_value = pstdev(values) if len(values) > 1 else 0.0
+        metric_value = metric_value_for_group(values, metric)
+        if metric_value is None:
+            continue
         description = label_value(grouping_column, group, maps)
         group_display = display_value(grouping_column, group, maps, display_labels)
         description_display = description or ""
@@ -2099,6 +2330,7 @@ def manage_filters(
                 weighting_config,
                 display_labels,
                 maps,
+                ranking_config,
             )
         elif choice == "7":
             show_filtered_statistics(
@@ -2175,6 +2407,8 @@ def manage_filters(
                     Path(output_csv),
                     use_max_scores,
                     weighting_config,
+                    ranking_config,
+                    maps,
                 )
         elif choice == "13":
             use_max_scores = not use_max_scores
