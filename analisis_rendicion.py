@@ -39,6 +39,7 @@ DEFAULT_CODEBOOK = (
     "PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20/"
     "Rinden_Admisión2025/Libro_CódigosADM2025_ArchivoC_Rinden.csv"
 )
+DEFAULT_RBD_COLEGIOS = "rbd_colegios_chile_2021_funcionando_geoportal.csv"
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class CodeMaps:
     regiones: Dict[str, str]
     comunas: Dict[str, str]
     value_labels: Dict[str, Dict[str, str]]
+    rbd_info: Dict[str, "RbdInfo"]
 
 
 @dataclass(frozen=True)
@@ -66,6 +68,13 @@ class WeightingConfig:
     weights: Dict[str, float]
     history_science_mode: str
     enabled: bool = False
+
+
+@dataclass(frozen=True)
+class RbdInfo:
+    name: str
+    comuna: str
+    region: str
 
 
 class AnalysisError(Exception):
@@ -518,19 +527,40 @@ def load_codebook(path: Path) -> Dict[str, Dict[str, str]]:
     return mappings
 
 
+def load_rbd_colegios(path: Path) -> Dict[str, RbdInfo]:
+    if not path.exists():
+        return {}
+    dialect = sniff_dialect(path)
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle, dialect=dialect)
+        mapping: Dict[str, RbdInfo] = {}
+        for row in reader:
+            rbd = normalize_code(row.get("RBD"))
+            name = normalize_code(row.get("NOM_RBD"))
+            comuna = normalize_code(row.get("NOM_COM_RB"))
+            region = normalize_code(row.get("NOM_REG_RB"))
+            if not rbd:
+                continue
+            mapping[rbd] = RbdInfo(name=name, comuna=comuna, region=region)
+        return mapping
+
+
 def build_code_maps(
     cod_ens_path: Path,
     comunas_path: Path,
     codebook_path: Path,
+    rbd_colegios_path: Path,
 ) -> CodeMaps:
     cod_ens = load_cod_ens(cod_ens_path)
     regiones, comunas = load_comunas_regiones(comunas_path)
     value_labels = load_codebook(codebook_path)
+    rbd_info = load_rbd_colegios(rbd_colegios_path)
     return CodeMaps(
         cod_ens=cod_ens,
         regiones=regiones,
         comunas=comunas,
         value_labels=value_labels,
+        rbd_info=rbd_info,
     )
 
 
@@ -565,6 +595,10 @@ def value_description(column: str, value: str, maps: CodeMaps) -> str:
         return maps.regiones[value]
     if column == "CODIGO_COMUNA" and value in maps.comunas:
         return maps.comunas[value]
+    if column == "RBD" and value in maps.rbd_info:
+        info = maps.rbd_info[value]
+        parts = [part for part in [info.name, info.comuna, info.region] if part]
+        return " - ".join(parts)
     return ""
 
 
@@ -818,6 +852,11 @@ def parse_args() -> argparse.Namespace:
         "--codebook-csv",
         default=DEFAULT_CODEBOOK,
         help="CSV con códigos y descripciones de variables.",
+    )
+    parser.add_argument(
+        "--rbd-colegios-csv",
+        default=DEFAULT_RBD_COLEGIOS,
+        help="CSV con equivalencias de RBD a colegio/comuna/región.",
     )
     parser.add_argument("--rbd", help="Lista de RBD separados por coma.")
     parser.add_argument("--situacion-egreso", help="Lista de situación de egreso.")
@@ -1191,6 +1230,63 @@ def print_column_value_help(
     print_table(["Valor", "Descripción", "Cantidad"], rows)
 
 
+def normalize_text(value: str) -> str:
+    return value.casefold().strip()
+
+
+def rbd_info_to_row(rbd: str, info: RbdInfo) -> List[str]:
+    return [
+        rbd,
+        info.name or "(sin nombre)",
+        info.comuna or "(sin comuna)",
+        info.region or "(sin región)",
+    ]
+
+
+def search_rbd_info(maps: CodeMaps, query: str) -> List[Tuple[str, RbdInfo]]:
+    if not query:
+        return []
+    needle = normalize_text(query)
+    matches = []
+    for rbd, info in maps.rbd_info.items():
+        haystack = " ".join([info.name, info.comuna, info.region]).casefold()
+        if needle in haystack:
+            matches.append((rbd, info))
+    return sorted(matches, key=lambda item: item[0])
+
+
+def prompt_rbd_lookup(maps: CodeMaps) -> None:
+    if not maps.rbd_info:
+        print("No se encontró el archivo de RBD colegios o está vacío.")
+        return
+    options = [
+        "Buscar por RBD",
+        "Buscar por nombre/comuna/región",
+        "Volver",
+    ]
+    selection = prompt_choice("Transformar RBD ↔ colegio:", options, default=1)
+    if selection == 1:
+        raw = input("Ingresa RBD (separados por coma): ").strip()
+        if not raw:
+            return
+        rows = []
+        for rbd in [item.strip() for item in raw.split(",") if item.strip()]:
+            info = maps.rbd_info.get(rbd)
+            if info:
+                rows.append(rbd_info_to_row(rbd, info))
+            else:
+                rows.append([rbd, "(no encontrado)", "-", "-"])
+        print_table(["RBD", "Colegio", "Comuna", "Región"], rows)
+    elif selection == 2:
+        query = input("Ingresa nombre/comuna/región: ").strip()
+        if not query:
+            return
+        matches = search_rbd_info(maps, query)
+        if not matches:
+            print("No se encontraron colegios con ese criterio.")
+            return
+        rows = [rbd_info_to_row(rbd, info) for rbd, info in matches]
+        print_table(["RBD", "Colegio", "Comuna", "Región"], rows)
 def prompt_column_value(
     column: str,
     data_path: Path,
@@ -1256,16 +1352,19 @@ def prompt_ranking_limit() -> Optional[int]:
     return None
 
 
-def calculate_row_value(row: Dict[str, str], columns: List[str]) -> Optional[float]:
+def evaluate_row_value(
+    row: Dict[str, str],
+    columns: List[str],
+) -> Tuple[Optional[float], bool]:
     values: List[float] = []
     for column in columns:
         value = to_float(row.get(column, ""))
-        if value is None:
-            return None
+        if value is None or value <= 0:
+            return None, False
         values.append(value)
     if not values:
-        return None
-    return mean(values)
+        return None, False
+    return mean(values), True
 
 
 def calculate_mode(values: List[float]) -> Optional[float]:
@@ -1576,6 +1675,7 @@ def show_filtered_ranking(
     subject_columns = subject_columns_for_weighting(use_max_scores)
 
     values_by_group: Dict[str, List[float]] = {}
+    excluded_by_group: Dict[str, int] = {}
     _, rows = read_csv_rows(data_path)
     for row in rows:
         transformed = apply_max_scores(row, use_max_scores)
@@ -1586,10 +1686,11 @@ def show_filtered_ranking(
             continue
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
-        value = calculate_row_value(transformed, value_columns)
-        if value is None:
-            continue
         group_value = normalize_code(transformed.get(grouping_column))
+        value, eligible_for_ranking = evaluate_row_value(transformed, value_columns)
+        if not eligible_for_ranking:
+            excluded_by_group[group_value] = excluded_by_group.get(group_value, 0) + 1
+            continue
         values_by_group.setdefault(group_value, []).append(value)
 
     if not values_by_group:
@@ -1617,6 +1718,7 @@ def show_filtered_ranking(
                 group or "(vacío)",
                 description or "",
                 len(values),
+                excluded_by_group.get(group, 0),
                 metric_value,
             ]
         )
@@ -1625,7 +1727,13 @@ def show_filtered_ranking(
     if limit:
         ranking_rows = ranking_rows[:limit]
 
-    headers = ["Grupo", "Descripción", "N", metric_label(metric, value_columns)]
+    headers = [
+        "Grupo",
+        "Descripción",
+        "Considerados",
+        "Excluidos",
+        metric_label(metric, value_columns),
+    ]
     formatted_rows = []
     for index, row in enumerate(ranking_rows, start=1):
         formatted_rows.append(
@@ -1634,7 +1742,8 @@ def show_filtered_ranking(
                 row[0],
                 row[1],
                 str(row[2]),
-                f"{row[3]:.2f}",
+                str(row[3]),
+                f"{row[4]:.2f}",
             ]
         )
     print("\nRanking con filtros actuales:")
@@ -1692,8 +1801,9 @@ def manage_filters(
             "11. Alternar puntajes MAX\n"
             "12. Configurar ponderación\n"
             "13. Eliminar ponderación\n"
-            "14. Continuar\n"
-            "15. Terminar programa"
+            "14. Transformar RBD/colegio\n"
+            "15. Continuar\n"
+            "16. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1906,6 +2016,8 @@ def manage_filters(
             else:
                 print("No hay ponderación activa para eliminar.")
         elif choice == "14":
+            prompt_rbd_lookup(maps)
+        elif choice == "15":
             return (
                 column_filters,
                 min_scores,
@@ -1916,7 +2028,7 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
             )
-        elif choice == "15":
+        elif choice == "16":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -2032,6 +2144,7 @@ def main() -> None:
         Path(args.cod_ens_csv),
         Path(args.comunas_csv),
         Path(args.codebook_csv),
+        Path(args.rbd_colegios_csv),
     )
 
     use_max_scores = False
