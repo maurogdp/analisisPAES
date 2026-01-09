@@ -2069,6 +2069,31 @@ def show_filtered_ranking_with_config(
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
     subject_columns = subject_columns_for_weighting(use_max_scores)
+    position_columns: List[str] = []
+    positions_by_rbd: Dict[str, Dict[str, int]] = {}
+    position_headers: List[str] = []
+    if grouping_column == "RBD":
+        position_columns = build_rbd_position_columns(config)
+        positions_by_rbd = build_rbd_positions(
+            data_path,
+            column_filters,
+            min_scores,
+            max_scores,
+            use_max_scores,
+            weighting,
+            config,
+            maps,
+        )
+        position_headers = [
+            {
+                RBD_POSITION_FILTERED: "Posición filtrada",
+                RBD_POSITION_NATIONAL: "Posición nacional",
+                RBD_POSITION_REGIONAL: "Posición regional",
+                RBD_POSITION_COMUNAL: "Posición comunal",
+                RBD_POSITION_DEPENDENCY: "Posición dependencia",
+            }.get(column, column)
+            for column in position_columns
+        ]
 
     values_by_group: Dict[str, List[float]] = {}
     excluded_by_group: Dict[str, int] = {}
@@ -2107,17 +2132,22 @@ def show_filtered_ranking_with_config(
         description_display = description or ""
         if display_labels and grouping_column in {"RBD", "CODIGO_COMUNA", "CODIGO_REGION"}:
             description_display = group or ""
+        positions = positions_by_rbd.get(group, {})
+        position_values = [positions.get(column, 0) for column in position_columns]
         ranking_rows.append(
             [
                 group_display or "(vacío)",
                 description_display,
                 len(values),
                 excluded_by_group.get(group, 0),
+                *position_values,
                 metric_value,
             ]
         )
 
-    ranking_rows.sort(key=lambda row: row[4], reverse=order_desc)
+    ranking_rows.sort(
+        key=lambda row: row[4 + len(position_columns)], reverse=order_desc
+    )
     if limit:
         ranking_rows = ranking_rows[:limit]
 
@@ -2126,10 +2156,17 @@ def show_filtered_ranking_with_config(
         "Descripción",
         "Considerados",
         "Excluidos",
+        *position_headers,
         metric_label(metric, value_columns),
     ]
     formatted_rows = []
+    position_count = len(position_columns)
     for index, row in enumerate(ranking_rows, start=1):
+        position_values = row[4 : 4 + position_count]
+        metric_value = row[4 + position_count]
+        formatted_positions = [
+            str(value) if value else "" for value in position_values
+        ]
         formatted_rows.append(
             [
                 f"{index}",
@@ -2137,7 +2174,8 @@ def show_filtered_ranking_with_config(
                 row[1],
                 str(row[2]),
                 str(row[3]),
-                f"{row[4]:.2f}",
+                *formatted_positions,
+                f"{metric_value:.2f}",
             ]
         )
     print("\nRanking con filtros actuales:")
