@@ -1396,6 +1396,8 @@ def count_filtered_rows(
     sort_keys: Sequence[SortKey],
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
+    display_labels: bool,
+    maps: CodeMaps,
 ) -> None:
     _, rows = read_csv_rows(data_path)
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
@@ -1437,7 +1439,11 @@ def count_filtered_rows(
     headers = ["#"] + numbered
     rows_table = []
     for index, row in enumerate(filtered_rows, start=1):
-        rows_table.append([str(index)] + [row.get(col, "") for col in fieldnames])
+        row_values = [
+            display_value(col, row.get(col, ""), maps, display_labels)
+            for col in fieldnames
+        ]
+        rows_table.append([str(index)] + row_values)
     print_table(headers, rows_table)
     if mapping:
         print("\nEncabezados numéricos:")
@@ -1661,6 +1667,7 @@ def show_filtered_ranking(
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
     maps: CodeMaps,
+    display_labels: bool,
 ) -> None:
     grouping_column = prompt_column(fieldnames)
     value_columns = prompt_ranking_value_columns(fieldnames)
@@ -1713,17 +1720,21 @@ def show_filtered_ranking(
         else:
             metric_value = pstdev(values) if len(values) > 1 else 0.0
         description = label_value(grouping_column, group, maps)
+        group_display = display_value(grouping_column, group, maps, display_labels)
+        description_display = description or ""
+        if display_labels and grouping_column in {"RBD", "CODIGO_COMUNA", "CODIGO_REGION"}:
+            description_display = group or ""
         ranking_rows.append(
             [
-                group or "(vacío)",
-                description or "",
+                group_display or "(vacío)",
+                description_display,
                 len(values),
                 excluded_by_group.get(group, 0),
                 metric_value,
             ]
         )
 
-    ranking_rows.sort(key=lambda row: row[3], reverse=order_desc)
+    ranking_rows.sort(key=lambda row: row[4], reverse=order_desc)
     if limit:
         ranking_rows = ranking_rows[:limit]
 
@@ -1763,6 +1774,7 @@ def manage_filters(
     initial_output_csv: Optional[str],
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
+    display_labels: bool,
 ) -> Tuple[
     Dict[str, set[str]],
     Dict[str, float],
@@ -1772,6 +1784,7 @@ def manage_filters(
     Optional[str],
     bool,
     Optional[WeightingConfig],
+    bool,
 ]:
     base_fieldnames = list(fieldnames)
     column_filters = dict(initial_column_filters)
@@ -1901,6 +1914,8 @@ def manage_filters(
                 sort_keys,
                 use_max_scores,
                 weighting_config,
+                display_labels,
+                maps,
             )
         elif choice == "7":
             show_filtered_statistics(
@@ -1934,6 +1949,7 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
                 maps,
+                display_labels,
             )
         elif choice == "10":
             output_csv = prompt_value(
@@ -2027,6 +2043,7 @@ def manage_filters(
                 output_csv,
                 use_max_scores,
                 weighting_config,
+                display_labels,
             )
         elif choice == "16":
             print("Programa terminado por el usuario.")
@@ -2047,6 +2064,7 @@ def collect_interactive_filters(
     List[SortKey],
     bool,
     Optional[WeightingConfig],
+    bool,
 ]:
     print("=== Modo interactivo: análisis de rendición ===")
 
@@ -2090,6 +2108,7 @@ def collect_interactive_filters(
         output_csv,
         use_max_scores,
         weighting_config,
+        display_labels,
     ) = manage_filters(
         fieldnames,
         data_path,
@@ -2103,6 +2122,7 @@ def collect_interactive_filters(
         args.output_csv,
         use_max_scores,
         weighting_config,
+        False,
     )
 
     active_fieldnames = build_active_fieldnames(
@@ -2123,7 +2143,15 @@ def collect_interactive_filters(
 
     min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
     max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
-    return column_filters, min_list, max_list, sort_keys, use_max_scores, weighting_config
+    return (
+        column_filters,
+        min_list,
+        max_list,
+        sort_keys,
+        use_max_scores,
+        weighting_config,
+        display_labels,
+    )
 
 
 def main() -> None:
@@ -2149,6 +2177,7 @@ def main() -> None:
 
     use_max_scores = False
     weighting_config = None
+    display_labels = False
     if args.interactive or len(sys.argv) == 1:
         (
             column_filters,
@@ -2157,6 +2186,7 @@ def main() -> None:
             sort_keys,
             use_max_scores,
             weighting_config,
+            display_labels,
         ) = collect_interactive_filters(args, fieldnames, data_path, maps)
     else:
         column_filters = {
