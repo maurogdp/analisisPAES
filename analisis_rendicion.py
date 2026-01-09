@@ -1844,6 +1844,8 @@ def show_filtered_ranking_with_config(
         if not row_matches(transformed, column_filters, min_list, max_list):
             continue
         group_value = normalize_code(transformed.get(grouping_column))
+        if not group_value:
+            continue
         value, eligible_for_ranking = evaluate_row_value(transformed, value_columns)
         if not eligible_for_ranking:
             excluded_by_group[group_value] = excluded_by_group.get(group_value, 0) + 1
