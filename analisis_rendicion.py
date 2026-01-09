@@ -1218,6 +1218,76 @@ def prompt_threshold(column: str) -> Optional[float]:
         return None
 
 
+def prompt_ranking_metric() -> str:
+    options = [
+        "Promedio",
+        "Mediana",
+        "Moda",
+        "Desv. Est.",
+    ]
+    selection = prompt_choice("Selecciona la métrica para el ranking:", options, default=1)
+    return {1: "mean", 2: "median", 3: "mode", 4: "stdev"}[selection]
+
+
+def prompt_ranking_value_columns(fieldnames: List[str]) -> List[str]:
+    options = [
+        "Analizar una sola columna",
+        "Promedio entre varias columnas",
+    ]
+    selection = prompt_choice("¿Qué deseas analizar?", options, default=1)
+    if selection == 1:
+        return [prompt_column(fieldnames)]
+    columns = prompt_stats_columns([], fieldnames)
+    if len(columns) < 2:
+        print("Debes seleccionar al menos dos columnas para promediar.")
+        return []
+    return columns
+
+
+def prompt_ranking_limit() -> Optional[int]:
+    raw = input("¿Cuántos resultados mostrar? (0 para todos) [20]: ").strip()
+    if not raw:
+        return 20
+    if raw == "0":
+        return None
+    if raw.isdigit():
+        return int(raw)
+    print("Número inválido, se mostrarán todos los resultados.")
+    return None
+
+
+def calculate_row_value(row: Dict[str, str], columns: List[str]) -> Optional[float]:
+    values: List[float] = []
+    for column in columns:
+        value = to_float(row.get(column, ""))
+        if value is None:
+            return None
+        values.append(value)
+    if not values:
+        return None
+    return mean(values)
+
+
+def calculate_mode(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    counts = Counter(values)
+    highest = max(counts.values())
+    candidates = [value for value, count in counts.items() if count == highest]
+    return min(candidates)
+
+
+def metric_label(metric: str, columns: List[str]) -> str:
+    column_label = columns[0] if len(columns) == 1 else "Promedio columnas"
+    labels = {
+        "mean": f"Promedio {column_label}",
+        "median": f"Mediana {column_label}",
+        "mode": f"Moda {column_label}",
+        "stdev": f"Desv. Est. {column_label}",
+    }
+    return labels.get(metric, column_label)
+
+
 def count_filtered_rows(
     data_path: Path,
     fieldnames: List[str],
@@ -1483,6 +1553,94 @@ def show_filtered_rbd_statistics(
     )
 
 
+def show_filtered_ranking(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+    maps: CodeMaps,
+) -> None:
+    grouping_column = prompt_column(fieldnames)
+    value_columns = prompt_ranking_value_columns(fieldnames)
+    if not value_columns:
+        return
+    metric = prompt_ranking_metric()
+    order_desc = prompt_yes_no("¿Ordenar de mayor a menor?", default=True)
+    limit = prompt_ranking_limit()
+
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    subject_columns = subject_columns_for_weighting(use_max_scores)
+
+    values_by_group: Dict[str, List[float]] = {}
+    _, rows = read_csv_rows(data_path)
+    for row in rows:
+        transformed = apply_max_scores(row, use_max_scores)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            continue
+        if not row_matches(transformed, column_filters, min_list, max_list):
+            continue
+        value = calculate_row_value(transformed, value_columns)
+        if value is None:
+            continue
+        group_value = normalize_code(transformed.get(grouping_column))
+        values_by_group.setdefault(group_value, []).append(value)
+
+    if not values_by_group:
+        print("No hay datos suficientes para generar el ranking.")
+        return
+
+    ranking_rows = []
+    for group, values in values_by_group.items():
+        if not values:
+            continue
+        if metric == "mean":
+            metric_value = mean(values)
+        elif metric == "median":
+            metric_value = median(values)
+        elif metric == "mode":
+            mode_value = calculate_mode(values)
+            if mode_value is None:
+                continue
+            metric_value = mode_value
+        else:
+            metric_value = pstdev(values) if len(values) > 1 else 0.0
+        description = label_value(grouping_column, group, maps)
+        ranking_rows.append(
+            [
+                group or "(vacío)",
+                description or "",
+                len(values),
+                metric_value,
+            ]
+        )
+
+    ranking_rows.sort(key=lambda row: row[3], reverse=order_desc)
+    if limit:
+        ranking_rows = ranking_rows[:limit]
+
+    headers = ["Grupo", "Descripción", "N", metric_label(metric, value_columns)]
+    formatted_rows = []
+    for index, row in enumerate(ranking_rows, start=1):
+        formatted_rows.append(
+            [
+                f"{index}",
+                row[0],
+                row[1],
+                str(row[2]),
+                f"{row[3]:.2f}",
+            ]
+        )
+    print("\nRanking con filtros actuales:")
+    print_table(["#", *headers], formatted_rows)
+
+
 def manage_filters(
     fieldnames: List[str],
     data_path: Path,
@@ -1529,12 +1687,13 @@ def manage_filters(
             "6. Mostrar datos actuales\n"
             "7. Ver estadísticos\n"
             "8. Ver estadísticos por RBD\n"
-            "9. Exportar filtrados a CSV\n"
-            "10. Alternar puntajes MAX\n"
-            "11. Configurar ponderación\n"
-            "12. Eliminar ponderación\n"
-            "13. Continuar\n"
-            "14. Terminar programa"
+            "9. Ver ranking\n"
+            "10. Exportar filtrados a CSV\n"
+            "11. Alternar puntajes MAX\n"
+            "12. Configurar ponderación\n"
+            "13. Eliminar ponderación\n"
+            "14. Continuar\n"
+            "15. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -1656,6 +1815,17 @@ def manage_filters(
                 weighting_config,
             )
         elif choice == "9":
+            show_filtered_ranking(
+                data_path,
+                fieldnames,
+                column_filters,
+                min_scores,
+                max_scores,
+                use_max_scores,
+                weighting_config,
+                maps,
+            )
+        elif choice == "10":
             output_csv = prompt_value(
                 "Ruta del CSV de salida", output_csv or "filtrados.csv"
             )
@@ -1671,7 +1841,7 @@ def manage_filters(
                     use_max_scores,
                     weighting_config,
                 )
-        elif choice == "10":
+        elif choice == "11":
             use_max_scores = not use_max_scores
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -1691,7 +1861,7 @@ def manage_filters(
             sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
             estado = "activado" if use_max_scores else "desactivado"
             print(f"Modo puntajes MAX {estado}.")
-        elif choice == "11":
+        elif choice == "12":
             weighting_config = prompt_weighting(weighting_config, use_max_scores)
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -1709,7 +1879,7 @@ def manage_filters(
                 fieldnames,
             )
             sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
-        elif choice == "12":
+        elif choice == "13":
             if weighting_config and weighting_config.enabled:
                 weighting_config = WeightingConfig(
                     weights=weighting_config.weights,
@@ -1735,7 +1905,7 @@ def manage_filters(
                 print("Ponderación eliminada.")
             else:
                 print("No hay ponderación activa para eliminar.")
-        elif choice == "13":
+        elif choice == "14":
             return (
                 column_filters,
                 min_scores,
@@ -1746,7 +1916,7 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
             )
-        elif choice == "14":
+        elif choice == "15":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
