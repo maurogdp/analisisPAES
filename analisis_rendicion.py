@@ -609,6 +609,18 @@ def label_value(column: str, value: str, maps: CodeMaps) -> str:
     return value
 
 
+def display_value(
+    column: str,
+    value: str,
+    maps: CodeMaps,
+    display_labels: bool,
+) -> str:
+    normalized = normalize_code(value)
+    if display_labels and normalized:
+        return label_value(column, normalized, maps)
+    return normalized
+
+
 def add_label_columns(row: Dict[str, str], maps: CodeMaps) -> Dict[str, str]:
     enriched = dict(row)
     cod_ens = normalize_code(row.get("COD_ENS"))
