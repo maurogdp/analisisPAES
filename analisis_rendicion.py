@@ -1411,7 +1411,7 @@ def prompt_remove_filter(filters: List[ColumnFilterRule]) -> bool:
     return True
 
 
-def print_table(rows: List[Dict[str, str]], columns: List[str]) -> None:
+def print_dict_table(rows: List[Dict[str, str]], columns: List[str]) -> None:
     if not rows:
         print("No hay datos para mostrar.")
         return
@@ -1585,26 +1585,26 @@ def prompt_oferta_filter(
                 filters.append(prompt_value_filter(column, unique_values))
             filtered_rows = apply_column_filters(rows, filters)
             print_filter_summary(filters)
-            print_table(filtered_rows, columns_to_show)
+            print_dict_table(filtered_rows, columns_to_show)
             continue
         if action == 2:
             prompt_remove_filter(filters)
             filtered_rows = apply_column_filters(rows, filters)
             print_filter_summary(filters)
-            print_table(filtered_rows, columns_to_show)
+            print_dict_table(filtered_rows, columns_to_show)
             continue
         if action == 3:
             filters = []
             filtered_rows = apply_column_filters(rows, filters)
             print_filter_summary(filters)
-            print_table(filtered_rows, columns_to_show)
+            print_dict_table(filtered_rows, columns_to_show)
             continue
         if action == 4:
             if not filtered_rows:
                 print("No hay datos para mostrar.")
                 continue
             print_filter_summary(filters)
-            print_table(filtered_rows, columns_to_show)
+            print_dict_table(filtered_rows, columns_to_show)
             continue
         if action == 5:
             columns_to_show = prompt_columns_to_display(fieldnames, columns_to_show)
@@ -1714,7 +1714,7 @@ def manage_postulacion_filters(
                 reverse=True,
             )
             print_filter_summary(filters)
-            print_table(filtered_rows, fieldnames)
+            print_dict_table(filtered_rows, fieldnames)
             scores = [
                 value
                 for value in (to_float(row.get("PTJE_PREF", "") or "") for row in filtered_rows)
