@@ -110,6 +110,15 @@ class ColumnFilterRule:
     predicate: Callable[[Dict[str, str]], bool]
 
 
+@dataclass
+class PostulacionSelectionContext:
+    rows: List[Dict[str, str]]
+    fieldnames: List[str]
+    filters: List[ColumnFilterRule]
+    sort_by: List[str]
+    sort_keys: List[SortKey]
+
+
 class AnalysisError(Exception):
     pass
 
@@ -2693,10 +2702,10 @@ def show_postulacion_selections_for_filtered_ids(
     max_scores: Dict[str, float],
     use_max_scores: bool,
     weighting: Optional[WeightingConfig],
-) -> None:
+) -> Optional[PostulacionSelectionContext]:
     if "ID_aux" not in fieldnames:
         print("No existe la columna ID_aux para buscar postulaciones.")
-        return
+        return None
     ids = collect_filtered_ids(
         data_path,
         column_filters,
@@ -2707,13 +2716,13 @@ def show_postulacion_selections_for_filtered_ids(
     )
     if not ids:
         print("No hay estudiantes filtrados para buscar en postulaciones.")
-        return
+        return None
     year = extract_year(data_path)
     if not year:
         year = prompt_value("Año a analizar", "")
     if not year:
         print("No se indicó un año válido para buscar en postulaciones.")
-        return
+        return None
     base_dir = Path.cwd()
     corrected = discover_corrected_files(base_dir)
     oferta_files = discover_oferta_files(base_dir).get(year, [])
@@ -2724,7 +2733,7 @@ def show_postulacion_selections_for_filtered_ids(
         DEFAULT_POSTULACION_DATA,
     )
     if not postulacion_path:
-        return
+        return None
     oferta_path = select_year_file(
         year,
         "oferta académica",
@@ -2732,7 +2741,7 @@ def show_postulacion_selections_for_filtered_ids(
         DEFAULT_OFERTA_DATA,
     )
     if not oferta_path:
-        return
+        return None
     oferta_map = load_oferta_map(Path(oferta_path))
     selection_rows = build_postulacion_selection_rows(
         ids,
@@ -2741,7 +2750,7 @@ def show_postulacion_selections_for_filtered_ids(
     )
     if not selection_rows:
         print("No se encontraron postulaciones para los estudiantes filtrados.")
-        return
+        return None
     headers = [
         "ID_aux",
         "CODIGO_CARRERA",
@@ -2752,13 +2761,91 @@ def show_postulacion_selections_for_filtered_ids(
         "TIPO_PREF",
         "PTJE_PREF",
     ]
+    selection_dicts = [dict(zip(headers, row)) for row in selection_rows]
     print("\nResultados de selección en postulaciones:")
-    print_table(headers, selection_rows)
-    selected_count = len({row[0] for row in selection_rows if row[5] == "Sí"})
+    print_dict_table(selection_dicts, headers)
+    selected_count = len(
+        {row["ID_aux"] for row in selection_dicts if row.get("SELECCIONADO") == "Sí"}
+    )
     print(
         f"\nEstudiantes filtrados: {len(ids)} | "
         f"Seleccionados en alguna preferencia: {selected_count}"
     )
+    return PostulacionSelectionContext(
+        rows=selection_dicts,
+        fieldnames=headers,
+        filters=[],
+        sort_by=[],
+        sort_keys=[],
+    )
+
+
+def manage_postulacion_selection_context(
+    context: PostulacionSelectionContext,
+) -> PostulacionSelectionContext:
+    while True:
+        filtered_rows = apply_column_filters(context.rows, context.filters)
+        print_filter_summary(context.filters)
+        if context.sort_by:
+            print(f"- Orden actual: {', '.join(context.sort_by)}")
+        action = prompt_choice(
+            "¿Qué deseas hacer con los resultados de postulaciones?",
+            [
+                "Agregar filtro",
+                "Quitar filtro",
+                "Limpiar filtros",
+                "Ordenar resultados",
+                "Mostrar resultados",
+                "Volver",
+            ],
+        )
+        if action == 1:
+            column = prompt_column_choice("Selecciona la columna a filtrar", context.fieldnames)
+            if column_is_numeric(filtered_rows or context.rows, column):
+                context.filters.append(prompt_numeric_filter(column))
+                continue
+            unique_values = sorted(
+                {
+                    row.get(column, "").strip()
+                    for row in (filtered_rows or context.rows)
+                    if row.get(column, "").strip() or row.get(column, "") == ""
+                }
+            )
+            if not unique_values:
+                print("No hay valores disponibles para filtrar.")
+                continue
+            if column in {"NOMBRE_UNIVERSIDAD", "NOMBRE_CARRERA"}:
+                context.filters.append(prompt_text_contains_filter(column))
+                continue
+            context.filters.append(prompt_text_or_value_filter(column, unique_values))
+            continue
+        if action == 2:
+            prompt_remove_filter(context.filters)
+            continue
+        if action == 3:
+            context.filters = []
+            continue
+        if action == 4:
+            context.sort_by = prompt_sort_by([], context.fieldnames)
+            context.sort_keys = (
+                parse_sort_by_args(context.sort_by, context.fieldnames) if context.sort_by else []
+            )
+            if context.sort_by:
+                print(f"Orden aplicado: {', '.join(context.sort_by)}")
+            else:
+                print("Orden limpiado; se usará el orden original.")
+            continue
+        if action == 5:
+            if not filtered_rows:
+                print("No hay datos para mostrar.")
+                continue
+            display_rows = list(filtered_rows)
+            if context.sort_keys:
+                sort_rows(display_rows, context.sort_keys)
+            print_dict_table(display_rows, context.fieldnames)
+            continue
+        if action == 6:
+            return context
 
 
 def count_filtered_rows(
@@ -3308,6 +3395,7 @@ def manage_filters(
     value_cache: Dict[str, Counter] = {}
     ranking_config: Optional[RankingConfig] = None
     view_mode = "datos"
+    selection_context: Optional[PostulacionSelectionContext] = None
 
     def refresh_ranking_if_visible() -> None:
         nonlocal ranking_config
@@ -3335,36 +3423,63 @@ def manage_filters(
         summarize_ranking(ranking_config)
         if sort_by:
             print(f"- Orden actual: {', '.join(sort_by)}")
-        print(
-            "\n¿Qué deseas hacer ahora?\n"
-            "1. Agregar filtro\n"
-            "2. Modificar filtro\n"
-            "3. Eliminar filtro\n"
-            "4. Reiniciar filtros\n"
-            "5. Ordenar datos\n"
-            "6. Mostrar datos actuales\n"
-            "7. Ver estadísticos\n"
-            "8. Ver estadísticos por RBD\n"
-            "9. Configurar/modificar ranking\n"
-            "10. Ver ranking\n"
-            "11. Eliminar ranking\n"
-            "12. Exportar filtrados a CSV\n"
-            "13. Alternar puntajes MAX\n"
-            "14. Configurar ponderación\n"
-            "15. Eliminar ponderación\n"
-            "16. Alternar nombre de colegio (RBD)\n"
-            "17. Buscar selección en postulaciones\n"
-            "18. Continuar\n"
-            + (
-                "19. Volver a menú de postulaciones\n"
-                "20. Cambiar a análisis de postulación\n"
-                "21. Terminar programa"
-                if allow_postulacion_return
-                else "19. Cambiar a análisis de postulación\n" "20. Terminar programa"
+        menu_items = [
+            ("Agregar filtro", "add_filter"),
+            ("Modificar filtro", "modify_filter"),
+            ("Eliminar filtro", "remove_filter"),
+            ("Reiniciar filtros", "reset_filters"),
+            ("Ordenar datos", "sort_data"),
+            ("Mostrar datos actuales", "show_data"),
+            ("Ver estadísticos", "show_stats"),
+            ("Ver estadísticos por RBD", "show_stats_rbd"),
+            ("Configurar/modificar ranking", "config_ranking"),
+            ("Ver ranking", "show_ranking"),
+            ("Eliminar ranking", "remove_ranking"),
+            ("Exportar filtrados a CSV", "export_csv"),
+            ("Alternar puntajes MAX", "toggle_max"),
+            ("Configurar ponderación", "config_weighting"),
+            ("Eliminar ponderación", "remove_weighting"),
+            ("Alternar nombre de colegio (RBD)", "toggle_rbd_name"),
+            ("Buscar selección en postulaciones", "search_postulacion"),
+        ]
+        if selection_context:
+            menu_items.append(
+                ("Ordenar/filtrar resultados de postulaciones", "manage_postulacion_results")
             )
-        )
-        choice = input("Selecciona una opción: ").strip()
-        if choice == "1":
+        menu_items.append(("Continuar", "continue"))
+        if allow_postulacion_return:
+            menu_items.extend(
+                [
+                    ("Volver a menú de postulaciones", "return_postulacion_menu"),
+                    ("Cambiar a análisis de postulación", "switch_postulacion"),
+                    ("Terminar programa", "exit_program"),
+                ]
+            )
+        else:
+            menu_items.extend(
+                [
+                    ("Cambiar a análisis de postulación", "switch_postulacion"),
+                    ("Terminar programa", "exit_program"),
+                ]
+            )
+        print("\n¿Qué deseas hacer ahora?")
+        for idx, (label, _) in enumerate(menu_items, start=1):
+            print(f"{idx}. {label}")
+        choice_raw = input("Selecciona una opción: ").strip()
+        if not choice_raw.isdigit():
+            print("Opción inválida.")
+            continue
+        choice = int(choice_raw)
+        if not 1 <= choice <= len(menu_items):
+            print("Opción inválida.")
+            continue
+        action = menu_items[choice - 1][1]
+        if selection_context and action not in {
+            "search_postulacion",
+            "manage_postulacion_results",
+        }:
+            selection_context = None
+        if action == "add_filter":
             print("\nTipos de filtro:")
             print("1. Valores exactos")
             print("2. Mínimo")
@@ -3403,7 +3518,7 @@ def manage_filters(
             else:
                 print("Tipo inválido.")
             refresh_ranking_if_visible()
-        elif choice == "2":
+        elif action == "modify_filter":
             index = build_filter_index(column_filters, min_scores, max_scores)
             if not index:
                 print("No hay filtros para modificar.")
@@ -3432,7 +3547,7 @@ def manage_filters(
                 if threshold is not None:
                     max_scores[column] = threshold
             refresh_ranking_if_visible()
-        elif choice == "3":
+        elif action == "remove_filter":
             index = build_filter_index(column_filters, min_scores, max_scores)
             if not index:
                 print("No hay filtros para eliminar.")
@@ -3455,20 +3570,20 @@ def manage_filters(
             elif kind == "max":
                 max_scores.pop(column, None)
             refresh_ranking_if_visible()
-        elif choice == "4":
+        elif action == "reset_filters":
             if prompt_yes_no("¿Seguro que deseas reiniciar los filtros?", default=False):
                 column_filters.clear()
                 min_scores.clear()
                 max_scores.clear()
                 refresh_ranking_if_visible()
-        elif choice == "5":
+        elif action == "sort_data":
             sort_by = prompt_sort_by([], fieldnames)
             sort_keys = parse_sort_by_args(sort_by, fieldnames)
             if sort_by:
                 print(f"Orden aplicado: {', '.join(sort_by)}")
             else:
                 print("Orden limpiado; se usará el orden del archivo.")
-        elif choice == "6":
+        elif action == "show_data":
             view_mode = "datos"
             count_filtered_rows(
                 data_path,
@@ -3484,7 +3599,7 @@ def manage_filters(
                 ranking_config,
                 show_rbd_name,
             )
-        elif choice == "7":
+        elif action == "show_stats":
             show_filtered_statistics(
                 data_path,
                 fieldnames,
@@ -3495,7 +3610,7 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
             )
-        elif choice == "8":
+        elif action == "show_stats_rbd":
             show_filtered_rbd_statistics(
                 data_path,
                 fieldnames,
@@ -3508,7 +3623,7 @@ def manage_filters(
                 maps,
                 show_rbd_name,
             )
-        elif choice == "9":
+        elif action == "config_ranking":
             ranking_config = update_ranking_config(ranking_config, fieldnames)
             if ranking_config:
                 view_mode = "ranking"
@@ -3525,7 +3640,7 @@ def manage_filters(
                     show_rbd_name,
                     ranking_config,
                 )
-        elif choice == "10":
+        elif action == "show_ranking":
             view_mode = "ranking"
             ranking_config = show_filtered_ranking_with_config(
                 data_path,
@@ -3540,7 +3655,7 @@ def manage_filters(
                 show_rbd_name,
                 ranking_config,
             )
-        elif choice == "11":
+        elif action == "remove_ranking":
             if ranking_config:
                 ranking_config = None
                 if view_mode == "ranking":
@@ -3548,7 +3663,7 @@ def manage_filters(
                 print("Ranking eliminado.")
             else:
                 print("No hay ranking configurado.")
-        elif choice == "12":
+        elif action == "export_csv":
             output_csv = prompt_value(
                 "Ruta del CSV de salida", output_csv or "filtrados.csv"
             )
@@ -3566,7 +3681,7 @@ def manage_filters(
                     ranking_config,
                     maps,
                 )
-        elif choice == "13":
+        elif action == "toggle_max":
             use_max_scores = not use_max_scores
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -3588,7 +3703,7 @@ def manage_filters(
             print(f"Modo puntajes MAX {estado}.")
             ranking_config = validate_ranking_config(ranking_config, fieldnames)
             refresh_ranking_if_visible()
-        elif choice == "14":
+        elif action == "config_weighting":
             weighting_config = prompt_weighting(weighting_config, use_max_scores)
             fieldnames = build_active_fieldnames(
                 base_fieldnames, use_max_scores, weighting_config
@@ -3608,7 +3723,7 @@ def manage_filters(
             sort_keys = parse_sort_by_args(sort_by, fieldnames) if sort_by else []
             ranking_config = validate_ranking_config(ranking_config, fieldnames)
             refresh_ranking_if_visible()
-        elif choice == "15":
+        elif action == "remove_weighting":
             if weighting_config and weighting_config.enabled:
                 weighting_config = WeightingConfig(
                     weights=weighting_config.weights,
@@ -3636,7 +3751,7 @@ def manage_filters(
                 print("No hay ponderación activa para eliminar.")
             ranking_config = validate_ranking_config(ranking_config, fieldnames)
             refresh_ranking_if_visible()
-        elif choice == "16":
+        elif action == "toggle_rbd_name":
             if not maps.rbd_info:
                 print("No se encontró el archivo de RBD colegios o está vacío.")
                 continue
@@ -3644,8 +3759,8 @@ def manage_filters(
             estado = "activado" if show_rbd_name else "desactivado"
             print(f"Nombre de colegio {estado}.")
             refresh_ranking_if_visible()
-        elif choice == "17":
-            show_postulacion_selections_for_filtered_ids(
+        elif action == "search_postulacion":
+            selection_context = show_postulacion_selections_for_filtered_ids(
                 data_path,
                 fieldnames,
                 column_filters,
@@ -3654,7 +3769,12 @@ def manage_filters(
                 use_max_scores,
                 weighting_config,
             )
-        elif choice == "18":
+        elif action == "manage_postulacion_results":
+            if not selection_context:
+                print("No hay resultados activos para ordenar o filtrar.")
+                continue
+            selection_context = manage_postulacion_selection_context(selection_context)
+        elif action == "continue":
             return (
                 column_filters,
                 min_scores,
@@ -3668,7 +3788,7 @@ def manage_filters(
                 show_rbd_name,
                 False,
             )
-        elif choice == "19" and allow_postulacion_return:
+        elif action == "return_postulacion_menu" and allow_postulacion_return:
             return (
                 column_filters,
                 min_scores,
@@ -3682,9 +3802,7 @@ def manage_filters(
                 show_rbd_name,
                 True,
             )
-        elif (choice == "19" and not allow_postulacion_return) or (
-            choice == "20" and allow_postulacion_return
-        ):
+        elif action == "switch_postulacion":
             year = extract_year(data_path)
             if not year:
                 year = prompt_value("Año a analizar", "")
@@ -3692,9 +3810,7 @@ def manage_filters(
                 run_postulacion_flow(year, Path.cwd())
             else:
                 print("No se indicó un año válido para análisis de postulación.")
-        elif (choice == "20" and not allow_postulacion_return) or (
-            choice == "21" and allow_postulacion_return
-        ):
+        elif action == "exit_program":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
