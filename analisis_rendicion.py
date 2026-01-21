@@ -357,8 +357,13 @@ def to_float(value: str) -> Optional[float]:
     value = value.strip()
     if not value:
         return None
+    normalized = value.replace(" ", "")
+    if "," in normalized and "." in normalized:
+        normalized = normalized.replace(".", "").replace(",", ".")
+    elif "," in normalized:
+        normalized = normalized.replace(",", ".")
     try:
-        return float(value)
+        return float(normalized)
     except ValueError:
         return None
 
