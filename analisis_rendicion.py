@@ -1639,10 +1639,109 @@ def show_career_details(row: Dict[str, str]) -> None:
     print(f"- Prueba electiva exigida: {elective_requirement(history_weight, science_weight)}")
 
 
+def weighting_from_oferta_row(row: Dict[str, str]) -> WeightingConfig:
+    weights = {
+        "nem": to_float(row.get("%_NOTAS", "") or "") or 0.0,
+        "ranking": to_float(row.get("%_Ranking", "") or "") or 0.0,
+        "clec": to_float(row.get("%_LENG", "") or "") or 0.0,
+        "mate1": to_float(row.get("%_MATE1", "") or "") or 0.0,
+        "mate2": to_float(row.get("%_MATE2", "") or "") or 0.0,
+        "historia": to_float(row.get("%_HYCS", "") or "") or 0.0,
+        "ciencias": to_float(row.get("%_CIEN", "") or "") or 0.0,
+    }
+    history_weight = weights.get("historia", 0.0)
+    science_weight = weights.get("ciencias", 0.0)
+    if history_weight > 0 and science_weight > 0:
+        history_science_mode = "mejor"
+    elif history_weight > 0:
+        history_science_mode = "historia"
+    elif science_weight > 0:
+        history_science_mode = "ciencias"
+    else:
+        history_science_mode = "mejor"
+    return WeightingConfig(
+        weights=weights,
+        history_science_mode=history_science_mode,
+        enabled=True,
+    )
+
+
+def run_rendicion_from_postulacion(
+    year: str,
+    base_dir: Path,
+    ids: List[str],
+    oferta_row: Dict[str, str],
+) -> bool:
+    corrected = discover_corrected_files(base_dir)
+    rendicion_path = select_corrected_file(
+        year,
+        "rendicion",
+        corrected,
+        DEFAULT_DATA,
+    )
+    if not rendicion_path:
+        return False
+    fieldnames, _ = read_csv_rows(Path(rendicion_path))
+    if "ID_aux" not in fieldnames:
+        print("No existe la columna ID_aux para filtrar resultados.")
+        return False
+    column_filters = {"ID_aux": set(ids)}
+    min_scores: Dict[str, float] = {}
+    max_scores: Dict[str, float] = {}
+    use_max_scores = True
+    weighting_config = weighting_from_oferta_row(oferta_row)
+    sort_by = [f"{WEIGHTED_SCORE_COLUMN}:desc"]
+    active_fieldnames = build_active_fieldnames(
+        fieldnames,
+        use_max_scores,
+        weighting_config,
+    )
+    sort_keys = parse_sort_by_args(sort_by, active_fieldnames)
+    maps = build_code_maps(
+        Path(DEFAULT_COD_ENS),
+        Path(DEFAULT_COMUNAS),
+        Path(DEFAULT_CODEBOOK),
+        Path(DEFAULT_RBD_COLEGIOS),
+    )
+    (
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        return_to_postulacion,
+    ) = manage_filters(
+        fieldnames,
+        Path(rendicion_path),
+        maps,
+        column_filters,
+        min_scores,
+        max_scores,
+        sort_by,
+        sort_keys,
+        "25,50,75",
+        None,
+        use_max_scores,
+        weighting_config,
+        False,
+        False,
+        allow_postulacion_return=True,
+    )
+    return return_to_postulacion
+
+
 def manage_postulacion_filters(
     rows: List[Dict[str, str]],
     fieldnames: List[str],
     estado_preferencia: Dict[str, str],
+    oferta_row: Dict[str, str],
+    year: str,
+    base_dir: Path,
 ) -> None:
     filters: List[ColumnFilterRule] = []
     base_rows = list(rows)
@@ -1655,7 +1754,7 @@ def manage_postulacion_filters(
                 "Quitar filtro",
                 "Limpiar filtros",
                 "Mostrar datos filtrados",
-                "Copiar ID_aux filtrados al portapapeles",
+                "Buscar ID_aux en resultados",
                 "Volver",
             ],
         )
@@ -1726,16 +1825,14 @@ def manage_postulacion_filters(
             continue
         if action == 5:
             if not filtered_rows:
-                print("No hay datos para copiar.")
+                print("No hay datos para buscar.")
                 continue
             ids = [row.get("ID_aux", "").strip() for row in filtered_rows if row.get("ID_aux", "")]
             if not ids:
                 print("No hay ID_aux disponibles.")
                 continue
-            if copy_to_clipboard("\n".join(ids)):
-                print("ID_aux copiados al portapapeles.")
-            else:
-                print("No se pudo copiar al portapapeles.")
+            if run_rendicion_from_postulacion(year, base_dir, ids, oferta_row):
+                return
             continue
         if action == 6:
             return
@@ -1825,6 +1922,9 @@ def run_postulacion_flow(year: str, base_dir: Path) -> bool:
             postulacion_rows,
             postulacion_fieldnames,
             estado_preferencia,
+            selected,
+            year,
+            base_dir,
         )
 
 
@@ -3000,6 +3100,7 @@ def manage_filters(
     weighting: Optional[WeightingConfig],
     display_labels: bool,
     show_rbd_name: bool,
+    allow_postulacion_return: bool = False,
 ) -> Tuple[
     Dict[str, set[str]],
     Dict[str, float],
@@ -3011,8 +3112,10 @@ def manage_filters(
     Optional[WeightingConfig],
     bool,
     bool,
+    bool,
 ]:
     base_fieldnames = list(fieldnames)
+    fieldnames = build_active_fieldnames(base_fieldnames, use_max_scores, weighting)
     column_filters = dict(initial_column_filters)
     min_scores = dict(initial_min_scores)
     max_scores = dict(initial_max_scores)
@@ -3068,8 +3171,13 @@ def manage_filters(
             "15. Eliminar ponderación\n"
             "16. Alternar nombre de colegio (RBD)\n"
             "17. Continuar\n"
-            "18. Cambiar a análisis de postulación\n"
-            "19. Terminar programa"
+            + (
+                "18. Volver a menú de postulaciones\n"
+                "19. Cambiar a análisis de postulación\n"
+                "20. Terminar programa"
+                if allow_postulacion_return
+                else "18. Cambiar a análisis de postulación\n" "19. Terminar programa"
+            )
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -3364,8 +3472,25 @@ def manage_filters(
                 weighting_config,
                 display_labels,
                 show_rbd_name,
+                False,
             )
-        elif choice == "18":
+        elif choice == "18" and allow_postulacion_return:
+            return (
+                column_filters,
+                min_scores,
+                max_scores,
+                sort_by,
+                sort_keys,
+                output_csv,
+                use_max_scores,
+                weighting_config,
+                display_labels,
+                show_rbd_name,
+                True,
+            )
+        elif (choice == "18" and not allow_postulacion_return) or (
+            choice == "19" and allow_postulacion_return
+        ):
             year = extract_year(data_path)
             if not year:
                 year = prompt_value("Año a analizar", "")
@@ -3373,7 +3498,9 @@ def manage_filters(
                 run_postulacion_flow(year, Path.cwd())
             else:
                 print("No se indicó un año válido para análisis de postulación.")
-        elif choice == "19":
+        elif (choice == "19" and not allow_postulacion_return) or (
+            choice == "20" and allow_postulacion_return
+        ):
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
@@ -3440,6 +3567,7 @@ def collect_interactive_filters(
         weighting_config,
         display_labels,
         show_rbd_name,
+        _,
     ) = manage_filters(
         fieldnames,
         data_path,
