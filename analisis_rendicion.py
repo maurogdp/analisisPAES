@@ -1304,10 +1304,12 @@ def apply_column_filters(
 
 
 def prompt_numeric_filter(column: str) -> ColumnFilterRule:
-    operator = prompt_choice(
+    operators = ["==", ">=", "<=", ">", "<"]
+    selection = prompt_choice(
         f"Operador para {column}",
-        ["==", ">=", "<=", ">", "<"],
+        operators,
     )
+    operator = operators[selection - 1]
     while True:
         raw_value = prompt_value("Valor numérico")
         value = to_float(raw_value)
