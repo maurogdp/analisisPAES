@@ -1170,7 +1170,13 @@ def prompt_year_file_selection(
         if selection == 3:
             return None
         if selection == 2:
-            run_postulacion_flow(year, base_dir)
+            switch_to_rendicion = run_postulacion_flow(year, base_dir)
+            if switch_to_rendicion:
+                data_path = select_corrected_file(
+                    year, "rendicion", available, default_path
+                )
+                if data_path:
+                    return data_path
             return None
         data_path = select_corrected_file(
             year, "rendicion", available, default_path
@@ -1471,6 +1477,22 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
+def read_clipboard_text() -> Optional[str]:
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        content = root.clipboard_get()
+        root.update()
+        root.destroy()
+        return content
+    except Exception:
+        return None
+
+
+def parse_clipboard_ids(text: str) -> List[str]:
+    return [value for value in re.split(r"[\s,;]+", text) if value]
+
+
 def load_estado_preferencia_map(path: Path) -> Dict[str, str]:
     fieldnames, rows = read_csv_rows(path)
     if not fieldnames:
@@ -1719,7 +1741,20 @@ def manage_postulacion_filters(
             return
 
 
-def run_postulacion_flow(year: str, base_dir: Path) -> None:
+def prompt_postulacion_menu() -> str:
+    print("Menú de postulación")
+    print("1. Buscar universidad y carrera")
+    print("2. Analizar postulaciones")
+    print("18. Cambiar a análisis de rendición")
+    print("19. Volver")
+    while True:
+        selection = input("Selecciona una opción: ").strip()
+        if selection in {"1", "2", "18", "19"}:
+            return selection
+        print("Selección inválida. Intenta nuevamente.")
+
+
+def run_postulacion_flow(year: str, base_dir: Path) -> bool:
     print("=== Modo interactivo: análisis de postulación ===")
     corrected = discover_corrected_files(base_dir)
     oferta_files = discover_oferta_files(base_dir).get(year, [])
@@ -1732,7 +1767,7 @@ def run_postulacion_flow(year: str, base_dir: Path) -> None:
         DEFAULT_OFERTA_DATA,
     )
     if not oferta_path:
-        return
+        return False
     estado_path = select_year_file(
         year,
         "estado de preferencia",
@@ -1740,7 +1775,7 @@ def run_postulacion_flow(year: str, base_dir: Path) -> None:
         DEFAULT_ESTADO_PREFERENCIA_DATA,
     )
     if not estado_path:
-        return
+        return False
     postulacion_path = select_corrected_file(
         year,
         "postulacion",
@@ -1748,22 +1783,21 @@ def run_postulacion_flow(year: str, base_dir: Path) -> None:
         DEFAULT_POSTULACION_DATA,
     )
     if not postulacion_path:
-        return
+        return False
 
     oferta_fieldnames, oferta_rows_iter = read_csv_rows(Path(oferta_path))
     oferta_rows = list(oferta_rows_iter)
     estado_preferencia = load_estado_preferencia_map(Path(estado_path))
 
     while True:
-        action = prompt_choice(
-            "Menú de postulación",
-            ["Buscar universidad y carrera", "Analizar postulaciones", "Volver"],
-        )
-        if action == 2:
+        action = prompt_postulacion_menu()
+        if action == "2":
             print("La opción 'Analizar postulaciones' aún no está habilitada.")
             continue
-        if action == 3:
-            return
+        if action == "18":
+            return True
+        if action == "19":
+            return False
         selected = prompt_oferta_filter(oferta_fieldnames, oferta_rows)
         if not selected:
             continue
@@ -1775,7 +1809,7 @@ def run_postulacion_flow(year: str, base_dir: Path) -> None:
         if confirm == 2:
             continue
         if confirm == 3:
-            return
+            return False
         carrera_codigo = normalize_code(selected.get("CODIGO_CARRERA"))
         postulacion_fieldnames, postulacion_rows_iter = read_csv_rows(Path(postulacion_path))
         postulacion_rows = [
@@ -3034,7 +3068,8 @@ def manage_filters(
             "15. Eliminar ponderación\n"
             "16. Alternar nombre de colegio (RBD)\n"
             "17. Continuar\n"
-            "18. Terminar programa"
+            "18. Cambiar a análisis de postulación\n"
+            "19. Terminar programa"
         )
         choice = input("Selecciona una opción: ").strip()
         if choice == "1":
@@ -3042,6 +3077,7 @@ def manage_filters(
             print("1. Valores exactos")
             print("2. Mínimo")
             print("3. Máximo")
+            print("4. ID_aux desde portapapeles")
             filter_type = input("Selecciona el tipo: ").strip()
             if filter_type == "1":
                 column = prompt_column(fieldnames)
@@ -3058,6 +3094,20 @@ def manage_filters(
                 threshold = prompt_threshold(column)
                 if threshold is not None:
                     max_scores[column] = threshold
+            elif filter_type == "4":
+                if "ID_aux" not in fieldnames:
+                    print("No existe la columna ID_aux para filtrar.")
+                else:
+                    clipboard_text = read_clipboard_text()
+                    if not clipboard_text or not clipboard_text.strip():
+                        print("No hay IDs en el portapapeles.")
+                    else:
+                        ids = parse_clipboard_ids(clipboard_text)
+                        if not ids:
+                            print("No hay IDs en el portapapeles.")
+                        else:
+                            column_filters["ID_aux"] = set(ids)
+                            print(f"Filtro aplicado con {len(ids)} ID_aux.")
             else:
                 print("Tipo inválido.")
             refresh_ranking_if_visible()
@@ -3316,6 +3366,14 @@ def manage_filters(
                 show_rbd_name,
             )
         elif choice == "18":
+            year = extract_year(data_path)
+            if not year:
+                year = prompt_value("Año a analizar", "")
+            if year:
+                run_postulacion_flow(year, Path.cwd())
+            else:
+                print("No se indicó un año válido para análisis de postulación.")
+        elif choice == "19":
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
         else:
