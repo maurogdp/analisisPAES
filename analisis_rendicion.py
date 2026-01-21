@@ -18,11 +18,12 @@ import argparse
 import csv
 import re
 import sys
+import tkinter
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean, median, pstdev
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_DATA = (
     "PROCESO-DE-ADMISIÓN-2025-RENDICIÓN-19-01-2025T23-39-20/"
@@ -41,6 +42,20 @@ DEFAULT_CODEBOOK = (
     "Rinden_Admisión2025/Libro_CódigosADM2025_ArchivoC_Rinden.csv"
 )
 DEFAULT_RBD_COLEGIOS = "rbd_colegios_chile_2021_funcionando_geoportal.csv"
+DEFAULT_POSTULACION_DATA = (
+    "PROCESO-DE-ADMISIÓN-2025-POSTULACIÓN-19-01-2025T23-38-41 (2)/"
+    "PostulaciónySelección_Admisión2025/ArchivoD_Adm2025_corregido_final.csv"
+)
+DEFAULT_OFERTA_DATA = (
+    "PROCESO-DE-ADMISIÓN-2025-POSTULACIÓN-19-01-2025T23-38-41 (2)/"
+    "PostulaciónySelección_Admisión2025/Libro_CódigosADM2025_ArchivoD_Anexo -  "
+    "Oferta académica_corregido.csv"
+)
+DEFAULT_ESTADO_PREFERENCIA_DATA = (
+    "PROCESO-DE-ADMISIÓN-2025-POSTULACIÓN-19-01-2025T23-38-41 (2)/"
+    "PostulaciónySelección_Admisión2025/Libro_CódigosADM2025_ArchivoD_Anexo -  "
+    "Estado Preferencia.csv"
+)
 
 
 @dataclass(frozen=True)
@@ -86,6 +101,13 @@ class RbdInfo:
     name: str
     comuna: str
     region: str
+
+
+@dataclass
+class ColumnFilterRule:
+    column: str
+    description: str
+    predicate: Callable[[Dict[str, str]], bool]
 
 
 class AnalysisError(Exception):
@@ -185,6 +207,43 @@ def discover_corrected_files(base_dir: Path) -> Dict[str, Dict[str, List[Path]]]
     for years in results.values():
         for paths in years.values():
             paths.sort()
+    return results
+
+
+def discover_oferta_files(base_dir: Path) -> Dict[str, List[Path]]:
+    results: Dict[str, List[Path]] = {}
+    for path in base_dir.rglob("*.csv"):
+        normalized = str(path).casefold()
+        if "oferta académica" not in normalized and "oferta academica" not in normalized:
+            continue
+        year = extract_year(path)
+        if not year:
+            continue
+        results.setdefault(year, []).append(path)
+    for year, paths in results.items():
+        paths.sort(
+            key=lambda item: (
+                0 if "corregido" in item.name.casefold() else 1,
+                str(item),
+            )
+        )
+        results[year] = paths
+    return results
+
+
+def discover_estado_preferencia_files(base_dir: Path) -> Dict[str, List[Path]]:
+    results: Dict[str, List[Path]] = {}
+    for path in base_dir.rglob("*.csv"):
+        normalized = str(path).casefold()
+        if "estado preferencia" not in normalized:
+            continue
+        year = extract_year(path)
+        if not year:
+            continue
+        results.setdefault(year, []).append(path)
+    for year, paths in results.items():
+        paths.sort()
+        results[year] = paths
     return results
 
 
@@ -1060,7 +1119,7 @@ def prompt_choice(label: str, options: List[str], default: Optional[int] = None)
         print("Selección inválida. Intenta nuevamente.")
 
 
-def prompt_data_file(default_path: str) -> str:
+def prompt_data_file(default_path: str) -> Optional[str]:
     while True:
         selection = prompt_choice(
             "¿Qué deseas realizar?",
@@ -1070,8 +1129,9 @@ def prompt_data_file(default_path: str) -> str:
             print("La comparación entre años aún no está disponible.")
             continue
         data_path = prompt_analysis_year(default_path)
-        if data_path:
+        if data_path is not None:
             return data_path
+        return None
 
 
 def prompt_analysis_year(default_path: str) -> Optional[str]:
@@ -1088,13 +1148,14 @@ def prompt_analysis_year(default_path: str) -> Optional[str]:
         year = years[selection - 1]
     else:
         year = prompt_value("Año a analizar", "")
-    return prompt_year_file_selection(year, available, default_path)
+    return prompt_year_file_selection(year, available, default_path, Path.cwd())
 
 
 def prompt_year_file_selection(
     year: str,
     available: Dict[str, Dict[str, List[Path]]],
     default_path: str,
+    base_dir: Path,
 ) -> Optional[str]:
     while True:
         selection = prompt_choice(
@@ -1104,11 +1165,8 @@ def prompt_year_file_selection(
         if selection == 3:
             return None
         if selection == 2:
-            print(
-                "Aún no existe código para analizar archivos de postulación. "
-                "Vuelve a seleccionar el tipo de archivo."
-            )
-            continue
+            run_postulacion_flow(year, base_dir)
+            return None
         data_path = select_corrected_file(
             year, "rendicion", available, default_path
         )
@@ -1159,6 +1217,37 @@ def select_corrected_file(
     return str(candidates[selection - 1])
 
 
+def select_year_file(
+    year: str,
+    label: str,
+    candidates: List[Path],
+    default_path: str,
+) -> Optional[str]:
+    if not candidates:
+        print(f"No se encontró un archivo para {label} en {year}.")
+        manual = prompt_value("Ruta del CSV", default_path)
+        if not manual:
+            return None
+        if not Path(manual).exists():
+            print("El archivo indicado no existe.")
+            return None
+        return manual
+    if len(candidates) == 1:
+        return str(candidates[0])
+    display = [str(path.relative_to(Path.cwd())) for path in candidates]
+    display.append("Ingresar otra ruta manualmente")
+    selection = prompt_choice(f"Archivos disponibles de {label} para {year}:", display)
+    if selection == len(display):
+        manual = prompt_value("Ruta del CSV", default_path)
+        if not manual:
+            return None
+        if not Path(manual).exists():
+            print("El archivo indicado no existe.")
+            return None
+        return manual
+    return str(candidates[selection - 1])
+
+
 def prompt_list_filter(label: str, current: Optional[str]) -> Optional[str]:
     if current:
         return current
@@ -1177,6 +1266,454 @@ def prompt_yes_no(label: str, default: bool = False) -> bool:
         if raw in {"n", "no"}:
             return False
         print("Respuesta inválida. Usa 's' o 'n'.")
+
+
+def prompt_column_choice(label: str, columns: List[str]) -> str:
+    selection = prompt_choice(label, columns)
+    return columns[selection - 1]
+
+
+def column_is_numeric(rows: List[Dict[str, str]], column: str) -> bool:
+    has_values = False
+    for row in rows:
+        raw = row.get(column, "").strip()
+        if not raw:
+            continue
+        has_values = True
+        if to_float(raw) is None:
+            return False
+    return has_values
+
+
+def apply_column_filters(
+    rows: List[Dict[str, str]],
+    filters: List[ColumnFilterRule],
+) -> List[Dict[str, str]]:
+    if not filters:
+        return list(rows)
+    filtered: List[Dict[str, str]] = []
+    for row in rows:
+        if all(rule.predicate(row) for rule in filters):
+            filtered.append(row)
+    return filtered
+
+
+def prompt_numeric_filter(column: str) -> ColumnFilterRule:
+    operator = prompt_choice(
+        f"Operador para {column}",
+        ["==", ">=", "<=", ">", "<"],
+    )
+    while True:
+        raw_value = prompt_value("Valor numérico")
+        value = to_float(raw_value)
+        if value is None:
+            print("Valor inválido. Debe ser numérico.")
+            continue
+        break
+
+    def predicate(row: Dict[str, str]) -> bool:
+        row_value = to_float(row.get(column, "") or "")
+        if row_value is None:
+            return False
+        if operator == "==":
+            return row_value == value
+        if operator == ">=":
+            return row_value >= value
+        if operator == "<=":
+            return row_value <= value
+        if operator == ">":
+            return row_value > value
+        if operator == "<":
+            return row_value < value
+        return False
+
+    return ColumnFilterRule(
+        column=column,
+        description=f"{column} {operator} {value:g}",
+        predicate=predicate,
+    )
+
+
+def prompt_value_filter(column: str, values: List[str]) -> ColumnFilterRule:
+    options = [value or "(vacío)" for value in values]
+    selection = prompt_choice(f"Selecciona el valor de {column}", options)
+    chosen_value = values[selection - 1]
+
+    def predicate(row: Dict[str, str]) -> bool:
+        return row.get(column, "").strip() == chosen_value
+
+    label = chosen_value or "(vacío)"
+    return ColumnFilterRule(
+        column=column,
+        description=f"{column} == {label}",
+        predicate=predicate,
+    )
+
+
+def prompt_text_contains_filter(column: str) -> ColumnFilterRule:
+    while True:
+        raw = prompt_value(f"Texto a buscar en {column}")
+        if len(raw.strip()) < 3:
+            print("Debes ingresar al menos 3 caracteres.")
+            continue
+        query = raw.strip().casefold()
+        break
+
+    def predicate(row: Dict[str, str]) -> bool:
+        return query in row.get(column, "").casefold()
+
+    return ColumnFilterRule(
+        column=column,
+        description=f"{column} contiene '{raw.strip()}'",
+        predicate=predicate,
+    )
+
+
+def print_filter_summary(filters: List[ColumnFilterRule]) -> None:
+    if not filters:
+        print("Filtros activos: ninguno.")
+        return
+    print("Filtros activos:")
+    for idx, rule in enumerate(filters, start=1):
+        print(f"{idx}. {rule.description}")
+
+
+def prompt_remove_filter(filters: List[ColumnFilterRule]) -> bool:
+    if not filters:
+        print("No hay filtros para eliminar.")
+        return False
+    options = [rule.description for rule in filters]
+    selection = prompt_choice("Selecciona el filtro a eliminar", options)
+    filters.pop(selection - 1)
+    return True
+
+
+def print_table(rows: List[Dict[str, str]], columns: List[str]) -> None:
+    if not rows:
+        print("No hay datos para mostrar.")
+        return
+    widths = {col: len(col) for col in columns}
+    for row in rows:
+        for col in columns:
+            widths[col] = max(widths[col], len(str(row.get(col, "")).strip()))
+    header = " | ".join(col.ljust(widths[col]) for col in columns)
+    separator = "-+-".join("-" * widths[col] for col in columns)
+    print(header)
+    print(separator)
+    for row in rows:
+        print(
+            " | ".join(str(row.get(col, "")).strip().ljust(widths[col]) for col in columns)
+        )
+
+
+def copy_to_clipboard(text: str) -> bool:
+    try:
+        root = tkinter.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
+def load_estado_preferencia_map(path: Path) -> Dict[str, str]:
+    fieldnames, rows = read_csv_rows(path)
+    if not fieldnames:
+        return {}
+    code_key = fieldnames[0]
+    desc_key = fieldnames[1] if len(fieldnames) > 1 else fieldnames[0]
+    mapping: Dict[str, str] = {}
+    for row in rows:
+        code = normalize_code(row.get(code_key))
+        if not code:
+            continue
+        mapping[code] = normalize_code(row.get(desc_key))
+    return mapping
+
+
+def elective_requirement(
+    history_weight: Optional[float],
+    science_weight: Optional[float],
+) -> str:
+    history = history_weight or 0.0
+    science = science_weight or 0.0
+    if science == 0 and history != 0:
+        return "Historia/Ciencias Sociales"
+    if science != 0 and history == 0:
+        return "Ciencias"
+    if science != 0 and history != 0 and science == history:
+        return "Historia o Ciencias (se usa el puntaje más alto)"
+    if science != 0 and history != 0:
+        if science > history:
+            return "Ciencias (mayor ponderación)"
+        if history > science:
+            return "Historia/Ciencias Sociales (mayor ponderación)"
+    return "Sin exigencia electiva"
+
+
+def prompt_oferta_filter(
+    fieldnames: List[str],
+    rows: List[Dict[str, str]],
+) -> Optional[Dict[str, str]]:
+    filters: List[ColumnFilterRule] = []
+    while True:
+        filtered_rows = apply_column_filters(rows, filters)
+        print(f"\nCarreras disponibles: {len(filtered_rows)}")
+        print_filter_summary(filters)
+        if filtered_rows:
+            options = [
+                f"{row.get('CODIGO_CARRERA', '')} - "
+                f"{row.get('NOMBRE_CARRERA', '')} "
+                f"({row.get('NOMBRE_UNIVERSIDAD', '')})"
+                for row in filtered_rows
+            ]
+        else:
+            options = []
+
+        action = prompt_choice(
+            "¿Qué deseas hacer?",
+            [
+                "Agregar filtro",
+                "Quitar filtro",
+                "Limpiar filtros",
+                "Seleccionar carrera",
+                "Volver",
+            ],
+        )
+        if action == 1:
+            column = prompt_column_choice("Selecciona la columna a filtrar", fieldnames)
+            if column in {"NOMBRE_UNIVERSIDAD", "NOMBRE_CARRERA"}:
+                filters.append(prompt_text_contains_filter(column))
+                continue
+            if column_is_numeric(filtered_rows or rows, column):
+                filters.append(prompt_numeric_filter(column))
+                continue
+            unique_values = sorted(
+                {
+                    row.get(column, "").strip()
+                    for row in (filtered_rows or rows)
+                    if row.get(column, "").strip() or row.get(column, "") == ""
+                }
+            )
+            if not unique_values:
+                print("No hay valores disponibles para filtrar.")
+                continue
+            filters.append(prompt_value_filter(column, unique_values))
+            continue
+        if action == 2:
+            prompt_remove_filter(filters)
+            continue
+        if action == 3:
+            filters = []
+            continue
+        if action == 4:
+            if not options:
+                print("No hay carreras disponibles para seleccionar.")
+                continue
+            selection = prompt_choice("Selecciona la carrera", options)
+            return filtered_rows[selection - 1]
+        if action == 5:
+            return None
+
+
+def show_career_details(row: Dict[str, str]) -> None:
+    history_weight = to_float(row.get("%_HYCS", "") or "")
+    science_weight = to_float(row.get("%_CIEN", "") or "")
+    print("\nDatos de la carrera seleccionada:")
+    print(f"- Código universidad: {row.get('UNI_CODIGO', '')}")
+    print(f"- Código carrera: {row.get('CODIGO_CARRERA', '')}")
+    print(f"- Universidad: {row.get('NOMBRE_UNIVERSIDAD', '')}")
+    print(f"- Carrera: {row.get('NOMBRE_CARRERA', '')}")
+    print(f"- Región casa matriz: {row.get('REGION_CASA_MATRIZ', '')}")
+    print("- Ponderaciones:")
+    print(f"  - NEM: {row.get('%_NOTAS', '')}")
+    print(f"  - Ranking: {row.get('%_Ranking', '')}")
+    print(f"  - Competencia Lectora: {row.get('%_LENG', '')}")
+    print(f"  - Matemática 1: {row.get('%_MATE1', '')}")
+    print(f"  - Matemática 2: {row.get('%_MATE2', '')}")
+    print(f"  - Historia/Ciencias Sociales: {row.get('%_HYCS', '')}")
+    print(f"  - Ciencias: {row.get('%_CIEN', '')}")
+    print(f"- Prueba electiva exigida: {elective_requirement(history_weight, science_weight)}")
+
+
+def manage_postulacion_filters(
+    rows: List[Dict[str, str]],
+    fieldnames: List[str],
+    estado_preferencia: Dict[str, str],
+) -> None:
+    filters: List[ColumnFilterRule] = []
+    base_rows = list(rows)
+    while True:
+        filtered_rows = apply_column_filters(base_rows, filters)
+        action = prompt_choice(
+            "¿Qué deseas hacer con las postulaciones?",
+            [
+                "Agregar filtro",
+                "Quitar filtro",
+                "Limpiar filtros",
+                "Mostrar datos filtrados",
+                "Copiar ID_aux filtrados al portapapeles",
+                "Volver",
+            ],
+        )
+        if action == 1:
+            column = prompt_column_choice("Selecciona la columna a filtrar", fieldnames)
+            if column == "ESTADO_PREF" and estado_preferencia:
+                print("Códigos de estado de preferencia:")
+                for code in sorted(estado_preferencia.keys(), key=lambda item: (len(item), item)):
+                    print(f"- {code}: {estado_preferencia[code]}")
+            if column_is_numeric(filtered_rows or base_rows, column):
+                filters.append(prompt_numeric_filter(column))
+                continue
+            unique_values = sorted(
+                {
+                    row.get(column, "").strip()
+                    for row in (filtered_rows or base_rows)
+                    if row.get(column, "").strip() or row.get(column, "") == ""
+                }
+            )
+            if not unique_values:
+                print("No hay valores disponibles para filtrar.")
+                continue
+            if column == "ESTADO_PREF" and estado_preferencia:
+                options = [
+                    f"{value} - {estado_preferencia.get(value, 'Sin descripción')}"
+                    for value in unique_values
+                ]
+                selection = prompt_choice("Selecciona el estado de preferencia", options)
+                chosen_value = unique_values[selection - 1]
+
+                def predicate(row: Dict[str, str]) -> bool:
+                    return row.get(column, "").strip() == chosen_value
+
+                filters.append(
+                    ColumnFilterRule(
+                        column=column,
+                        description=f"{column} == {chosen_value}",
+                        predicate=predicate,
+                    )
+                )
+                continue
+            filters.append(prompt_value_filter(column, unique_values))
+            continue
+        if action == 2:
+            prompt_remove_filter(filters)
+            continue
+        if action == 3:
+            filters = []
+            continue
+        if action == 4:
+            if not filtered_rows:
+                print("No hay datos para mostrar.")
+                continue
+            filtered_rows.sort(
+                key=lambda row: to_float(row.get("PTJE_PREF", "") or "") or -1,
+                reverse=True,
+            )
+            print_filter_summary(filters)
+            print_table(filtered_rows, fieldnames)
+            scores = [
+                value
+                for value in (to_float(row.get("PTJE_PREF", "") or "") for row in filtered_rows)
+                if value is not None
+            ]
+            if scores:
+                print(f"Puntaje máximo: {max(scores):g}")
+                print(f"Puntaje mínimo: {min(scores):g}")
+            continue
+        if action == 5:
+            if not filtered_rows:
+                print("No hay datos para copiar.")
+                continue
+            ids = [row.get("ID_aux", "").strip() for row in filtered_rows if row.get("ID_aux", "")]
+            if not ids:
+                print("No hay ID_aux disponibles.")
+                continue
+            if copy_to_clipboard("\n".join(ids)):
+                print("ID_aux copiados al portapapeles.")
+            else:
+                print("No se pudo copiar al portapapeles.")
+            continue
+        if action == 6:
+            return
+
+
+def run_postulacion_flow(year: str, base_dir: Path) -> None:
+    print("=== Modo interactivo: análisis de postulación ===")
+    corrected = discover_corrected_files(base_dir)
+    oferta_files = discover_oferta_files(base_dir).get(year, [])
+    estado_files = discover_estado_preferencia_files(base_dir).get(year, [])
+
+    oferta_path = select_year_file(
+        year,
+        "oferta académica",
+        oferta_files,
+        DEFAULT_OFERTA_DATA,
+    )
+    if not oferta_path:
+        return
+    estado_path = select_year_file(
+        year,
+        "estado de preferencia",
+        estado_files,
+        DEFAULT_ESTADO_PREFERENCIA_DATA,
+    )
+    if not estado_path:
+        return
+    postulacion_path = select_corrected_file(
+        year,
+        "postulacion",
+        corrected,
+        DEFAULT_POSTULACION_DATA,
+    )
+    if not postulacion_path:
+        return
+
+    oferta_fieldnames, oferta_rows_iter = read_csv_rows(Path(oferta_path))
+    oferta_rows = list(oferta_rows_iter)
+    estado_preferencia = load_estado_preferencia_map(Path(estado_path))
+
+    while True:
+        action = prompt_choice(
+            "Menú de postulación",
+            ["Buscar universidad y carrera", "Analizar postulaciones", "Volver"],
+        )
+        if action == 2:
+            print("La opción 'Analizar postulaciones' aún no está habilitada.")
+            continue
+        if action == 3:
+            return
+        selected = prompt_oferta_filter(oferta_fieldnames, oferta_rows)
+        if not selected:
+            continue
+        show_career_details(selected)
+        confirm = prompt_choice(
+            "¿Qué deseas hacer ahora?",
+            ["Confirmar carrera", "Cambiar carrera", "Volver"],
+        )
+        if confirm == 2:
+            continue
+        if confirm == 3:
+            return
+        carrera_codigo = normalize_code(selected.get("CODIGO_CARRERA"))
+        postulacion_fieldnames, postulacion_rows_iter = read_csv_rows(Path(postulacion_path))
+        postulacion_rows = [
+            row
+            for row in postulacion_rows_iter
+            if normalize_code(row.get("COD_CARRERA_PREF")) == carrera_codigo
+        ]
+        print(
+            f"Postulaciones encontradas para la carrera {carrera_codigo}: "
+            f"{len(postulacion_rows)}"
+        )
+        manage_postulacion_filters(
+            postulacion_rows,
+            postulacion_fieldnames,
+            estado_preferencia,
+        )
 
 
 def prompt_score_filters(kind: str, existing: List[str], fieldnames: List[str]) -> List[str]:
@@ -2817,7 +3354,10 @@ def collect_interactive_filters(
 def main() -> None:
     args = parse_args()
     if args.interactive or len(sys.argv) == 1:
-        args.data = prompt_data_file(args.data)
+        selected = prompt_data_file(args.data)
+        if selected is None:
+            return
+        args.data = selected
     data_path = Path(args.data)
     if not data_path.exists():
         raise AnalysisError(f"No se encontró el archivo de datos: {data_path}")
