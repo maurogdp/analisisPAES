@@ -1493,6 +1493,17 @@ def parse_clipboard_ids(text: str) -> List[str]:
     return [value for value in re.split(r"[\s,;]+", text) if value]
 
 
+def unique_preserve_order(values: Iterable[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
 def load_estado_preferencia_map(path: Path) -> Dict[str, str]:
     fieldnames, rows = read_csv_rows(path)
     if not fieldnames:
@@ -1506,6 +1517,74 @@ def load_estado_preferencia_map(path: Path) -> Dict[str, str]:
             continue
         mapping[code] = normalize_code(row.get(desc_key))
     return mapping
+
+
+def load_oferta_map(path: Path) -> Dict[str, Dict[str, str]]:
+    fieldnames, rows = read_csv_rows(path)
+    if not fieldnames:
+        return {}
+    mapping: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        codigo_carrera = normalize_code(row.get("CODIGO_CARRERA") or row.get(fieldnames[0]))
+        if not codigo_carrera:
+            continue
+        mapping[codigo_carrera] = {
+            "CODIGO_CARRERA": codigo_carrera,
+            "UNI_CODIGO": normalize_code(row.get("UNI_CODIGO")),
+            "NOMBRE_UNIVERSIDAD": normalize_code(row.get("NOMBRE_UNIVERSIDAD")),
+            "NOMBRE_CARRERA": normalize_code(row.get("NOMBRE_CARRERA")),
+        }
+    return mapping
+
+
+def build_postulacion_selection_rows(
+    ids: Sequence[str],
+    postulacion_path: Path,
+    oferta_map: Dict[str, Dict[str, str]],
+) -> List[List[str]]:
+    ids_ordered = unique_preserve_order(normalize_code(value) for value in ids if value)
+    ids_set = set(ids_ordered)
+    selected_ids: set[str] = set()
+    selection_rows: List[List[str]] = []
+    _, postulacion_rows = read_csv_rows(postulacion_path)
+    for row in postulacion_rows:
+        student_id = normalize_code(row.get("ID_aux"))
+        if student_id not in ids_set:
+            continue
+        estado = normalize_code(row.get("ESTADO_PREF"))
+        if estado != "24":
+            continue
+        selected_ids.add(student_id)
+        codigo_carrera = normalize_code(row.get("COD_CARRERA_PREF"))
+        oferta_info = oferta_map.get(codigo_carrera, {})
+        selection_rows.append(
+            [
+                student_id,
+                codigo_carrera,
+                oferta_info.get("UNI_CODIGO", ""),
+                oferta_info.get("NOMBRE_UNIVERSIDAD", ""),
+                oferta_info.get("NOMBRE_CARRERA", ""),
+                "Sí",
+                normalize_code(row.get("TIPO_PREF")),
+                normalize_code(row.get("PTJE_PREF")),
+            ]
+        )
+    for student_id in ids_ordered:
+        if student_id in selected_ids:
+            continue
+        selection_rows.append(
+            [
+                student_id,
+                "",
+                "",
+                "",
+                "",
+                "No",
+                "",
+                "",
+            ]
+        )
+    return selection_rows
 
 
 def elective_requirement(
@@ -2578,6 +2657,110 @@ def validate_ranking_config(
     return config
 
 
+def collect_filtered_ids(
+    data_path: Path,
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+) -> List[str]:
+    min_list = [ScoreFilter(column=col, threshold=value) for col, value in min_scores.items()]
+    max_list = [ScoreFilter(column=col, threshold=value) for col, value in max_scores.items()]
+    _, rows = read_csv_rows(data_path)
+    subject_columns = subject_columns_for_weighting(use_max_scores)
+    ids: List[str] = []
+    for row in rows:
+        transformed = apply_max_scores(row, use_max_scores)
+        transformed, eligible = apply_weighted_score(
+            transformed, weighting, subject_columns
+        )
+        if weighting and weighting.enabled and not eligible:
+            continue
+        if not row_matches(transformed, column_filters, min_list, max_list):
+            continue
+        student_id = normalize_code(transformed.get("ID_aux"))
+        if student_id:
+            ids.append(student_id)
+    return unique_preserve_order(ids)
+
+
+def show_postulacion_selections_for_filtered_ids(
+    data_path: Path,
+    fieldnames: List[str],
+    column_filters: Dict[str, set[str]],
+    min_scores: Dict[str, float],
+    max_scores: Dict[str, float],
+    use_max_scores: bool,
+    weighting: Optional[WeightingConfig],
+) -> None:
+    if "ID_aux" not in fieldnames:
+        print("No existe la columna ID_aux para buscar postulaciones.")
+        return
+    ids = collect_filtered_ids(
+        data_path,
+        column_filters,
+        min_scores,
+        max_scores,
+        use_max_scores,
+        weighting,
+    )
+    if not ids:
+        print("No hay estudiantes filtrados para buscar en postulaciones.")
+        return
+    year = extract_year(data_path)
+    if not year:
+        year = prompt_value("Año a analizar", "")
+    if not year:
+        print("No se indicó un año válido para buscar en postulaciones.")
+        return
+    base_dir = Path.cwd()
+    corrected = discover_corrected_files(base_dir)
+    oferta_files = discover_oferta_files(base_dir).get(year, [])
+    postulacion_path = select_corrected_file(
+        year,
+        "postulacion",
+        corrected,
+        DEFAULT_POSTULACION_DATA,
+    )
+    if not postulacion_path:
+        return
+    oferta_path = select_year_file(
+        year,
+        "oferta académica",
+        oferta_files,
+        DEFAULT_OFERTA_DATA,
+    )
+    if not oferta_path:
+        return
+    oferta_map = load_oferta_map(Path(oferta_path))
+    selection_rows = build_postulacion_selection_rows(
+        ids,
+        Path(postulacion_path),
+        oferta_map,
+    )
+    if not selection_rows:
+        print("No se encontraron postulaciones para los estudiantes filtrados.")
+        return
+    headers = [
+        "ID_aux",
+        "CODIGO_CARRERA",
+        "UNI_CODIGO",
+        "NOMBRE_UNIVERSIDAD",
+        "NOMBRE_CARRERA",
+        "SELECCIONADO",
+        "TIPO_PREF",
+        "PTJE_PREF",
+    ]
+    print("\nResultados de selección en postulaciones:")
+    print_table(headers, selection_rows)
+    selected_count = len({row[0] for row in selection_rows if row[5] == "Sí"})
+    print(
+        f"\nEstudiantes filtrados: {len(ids)} | "
+        f"Seleccionados en alguna preferencia: {selected_count}"
+    )
+
+
 def count_filtered_rows(
     data_path: Path,
     fieldnames: List[str],
@@ -3170,13 +3353,14 @@ def manage_filters(
             "14. Configurar ponderación\n"
             "15. Eliminar ponderación\n"
             "16. Alternar nombre de colegio (RBD)\n"
-            "17. Continuar\n"
+            "17. Buscar selección en postulaciones\n"
+            "18. Continuar\n"
             + (
-                "18. Volver a menú de postulaciones\n"
-                "19. Cambiar a análisis de postulación\n"
-                "20. Terminar programa"
+                "19. Volver a menú de postulaciones\n"
+                "20. Cambiar a análisis de postulación\n"
+                "21. Terminar programa"
                 if allow_postulacion_return
-                else "18. Cambiar a análisis de postulación\n" "19. Terminar programa"
+                else "19. Cambiar a análisis de postulación\n" "20. Terminar programa"
             )
         )
         choice = input("Selecciona una opción: ").strip()
@@ -3461,6 +3645,16 @@ def manage_filters(
             print(f"Nombre de colegio {estado}.")
             refresh_ranking_if_visible()
         elif choice == "17":
+            show_postulacion_selections_for_filtered_ids(
+                data_path,
+                fieldnames,
+                column_filters,
+                min_scores,
+                max_scores,
+                use_max_scores,
+                weighting_config,
+            )
+        elif choice == "18":
             return (
                 column_filters,
                 min_scores,
@@ -3474,7 +3668,7 @@ def manage_filters(
                 show_rbd_name,
                 False,
             )
-        elif choice == "18" and allow_postulacion_return:
+        elif choice == "19" and allow_postulacion_return:
             return (
                 column_filters,
                 min_scores,
@@ -3488,8 +3682,8 @@ def manage_filters(
                 show_rbd_name,
                 True,
             )
-        elif (choice == "18" and not allow_postulacion_return) or (
-            choice == "19" and allow_postulacion_return
+        elif (choice == "19" and not allow_postulacion_return) or (
+            choice == "20" and allow_postulacion_return
         ):
             year = extract_year(data_path)
             if not year:
@@ -3498,8 +3692,8 @@ def manage_filters(
                 run_postulacion_flow(year, Path.cwd())
             else:
                 print("No se indicó un año válido para análisis de postulación.")
-        elif (choice == "19" and not allow_postulacion_return) or (
-            choice == "20" and allow_postulacion_return
+        elif (choice == "20" and not allow_postulacion_return) or (
+            choice == "21" and allow_postulacion_return
         ):
             print("Programa terminado por el usuario.")
             raise SystemExit(0)
