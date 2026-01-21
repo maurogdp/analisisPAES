@@ -1369,6 +1369,16 @@ def prompt_text_contains_filter(column: str) -> ColumnFilterRule:
     )
 
 
+def prompt_text_or_value_filter(column: str, values: List[str]) -> ColumnFilterRule:
+    selection = prompt_choice(
+        f"¿Cómo deseas filtrar {column}?",
+        ["Contiene texto", "Seleccionar valor exacto"],
+    )
+    if selection == 1:
+        return prompt_text_contains_filter(column)
+    return prompt_value_filter(column, values)
+
+
 def print_filter_summary(filters: List[ColumnFilterRule]) -> None:
     if not filters:
         print("Filtros activos: ninguno.")
@@ -1404,6 +1414,41 @@ def print_table(rows: List[Dict[str, str]], columns: List[str]) -> None:
         print(
             " | ".join(str(row.get(col, "")).strip().ljust(widths[col]) for col in columns)
         )
+
+
+def prompt_columns_to_display(fieldnames: List[str], current: List[str]) -> List[str]:
+    if not fieldnames:
+        print("No hay columnas disponibles.")
+        return current
+    current_set = set(current or fieldnames)
+    print("\nColumnas disponibles para mostrar:")
+    for idx, column in enumerate(fieldnames, start=1):
+        marker = "✓" if column in current_set else " "
+        print(f"{idx}. [{marker}] {column}")
+    while True:
+        raw = input(
+            "Ingresa los números de columnas a mostrar (coma), 0=todas, Enter=mantener: "
+        ).strip()
+        if not raw:
+            return current or list(fieldnames)
+        if raw == "0":
+            return list(fieldnames)
+        try:
+            selections = {int(value.strip()) for value in raw.split(",") if value.strip()}
+        except ValueError:
+            print("Entrada inválida. Usa números separados por coma.")
+            continue
+        if not selections:
+            print("Debes seleccionar al menos una columna.")
+            continue
+        if any(selection < 1 or selection > len(fieldnames) for selection in selections):
+            print("Selecciona números dentro del rango mostrado.")
+            continue
+        return [
+            column
+            for idx, column in enumerate(fieldnames, start=1)
+            if idx in selections
+        ]
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -1459,6 +1504,7 @@ def prompt_oferta_filter(
     rows: List[Dict[str, str]],
 ) -> Optional[Dict[str, str]]:
     filters: List[ColumnFilterRule] = []
+    columns_to_show = list(fieldnames)
     while True:
         filtered_rows = apply_column_filters(rows, filters)
         print(f"\nCarreras disponibles: {len(filtered_rows)}")
@@ -1479,18 +1525,14 @@ def prompt_oferta_filter(
                 "Agregar filtro",
                 "Quitar filtro",
                 "Limpiar filtros",
+                "Mostrar datos actuales",
+                "Seleccionar columnas a mostrar",
                 "Seleccionar carrera",
                 "Volver",
             ],
         )
         if action == 1:
             column = prompt_column_choice("Selecciona la columna a filtrar", fieldnames)
-            if column in {"NOMBRE_UNIVERSIDAD", "NOMBRE_CARRERA"}:
-                filters.append(prompt_text_contains_filter(column))
-                continue
-            if column_is_numeric(filtered_rows or rows, column):
-                filters.append(prompt_numeric_filter(column))
-                continue
             unique_values = sorted(
                 {
                     row.get(column, "").strip()
@@ -1498,24 +1540,53 @@ def prompt_oferta_filter(
                     if row.get(column, "").strip() or row.get(column, "") == ""
                 }
             )
-            if not unique_values:
-                print("No hay valores disponibles para filtrar.")
-                continue
-            filters.append(prompt_value_filter(column, unique_values))
+            if column == "NOMBRE_UNIVERSIDAD":
+                if not unique_values:
+                    print("No hay valores disponibles para filtrar.")
+                    continue
+                filters.append(prompt_text_or_value_filter(column, unique_values))
+            elif column == "NOMBRE_CARRERA":
+                filters.append(prompt_text_contains_filter(column))
+            elif column_is_numeric(filtered_rows or rows, column):
+                filters.append(prompt_numeric_filter(column))
+            else:
+                if not unique_values:
+                    print("No hay valores disponibles para filtrar.")
+                    continue
+                filters.append(prompt_value_filter(column, unique_values))
+            filtered_rows = apply_column_filters(rows, filters)
+            print_filter_summary(filters)
+            print_table(filtered_rows, columns_to_show)
             continue
         if action == 2:
             prompt_remove_filter(filters)
+            filtered_rows = apply_column_filters(rows, filters)
+            print_filter_summary(filters)
+            print_table(filtered_rows, columns_to_show)
             continue
         if action == 3:
             filters = []
+            filtered_rows = apply_column_filters(rows, filters)
+            print_filter_summary(filters)
+            print_table(filtered_rows, columns_to_show)
             continue
         if action == 4:
+            if not filtered_rows:
+                print("No hay datos para mostrar.")
+                continue
+            print_filter_summary(filters)
+            print_table(filtered_rows, columns_to_show)
+            continue
+        if action == 5:
+            columns_to_show = prompt_columns_to_display(fieldnames, columns_to_show)
+            continue
+        if action == 6:
             if not options:
                 print("No hay carreras disponibles para seleccionar.")
                 continue
             selection = prompt_choice("Selecciona la carrera", options)
             return filtered_rows[selection - 1]
-        if action == 5:
+        if action == 7:
             return None
 
 
