@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -154,6 +155,37 @@ def discover_rendicion_csvs(base_dir: Path) -> List[Path]:
             fallback.append(path)
     candidates = preferred or fallback
     return sorted(candidates)
+
+
+def extract_year(path: Path) -> Optional[str]:
+    haystack = str(path)
+    match = re.search(r"ADMISI[ÓO]N-(\d{4})", haystack, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"Adm(\d{4})", haystack, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def discover_corrected_files(base_dir: Path) -> Dict[str, Dict[str, List[Path]]]:
+    results: Dict[str, Dict[str, List[Path]]] = {}
+    for path in base_dir.rglob("*_corregido_final.csv"):
+        normalized = str(path).casefold()
+        if "rendición" in normalized or "rendicion" in normalized:
+            kind = "rendicion"
+        elif "postulación" in normalized or "postulacion" in normalized:
+            kind = "postulacion"
+        else:
+            continue
+        year = extract_year(path)
+        if not year:
+            continue
+        results.setdefault(year, {}).setdefault(kind, []).append(path)
+    for years in results.values():
+        for paths in years.values():
+            paths.sort()
+    return results
 
 
 def sniff_dialect(path: Path) -> csv.Dialect:
@@ -966,22 +998,101 @@ def prompt_choice(label: str, options: List[str], default: Optional[int] = None)
 
 
 def prompt_data_file(default_path: str) -> str:
-    candidates = discover_rendicion_csvs(Path.cwd())
+    while True:
+        selection = prompt_choice(
+            "¿Qué deseas realizar?",
+            ["Comparar entre distintos años", "Analizar un año en particular"],
+        )
+        if selection == 1:
+            print("La comparación entre años aún no está disponible.")
+            continue
+        data_path = prompt_analysis_year(default_path)
+        if data_path:
+            return data_path
+
+
+def prompt_analysis_year(default_path: str) -> Optional[str]:
+    available = discover_corrected_files(Path.cwd())
+    years = sorted(available.keys())
+    year_options = years + ["Ingresar otro año manualmente"]
+    year_default = len(years) if years else None
+    selection = prompt_choice(
+        "Selecciona el año que deseas analizar:",
+        year_options if year_options else ["Ingresar otro año manualmente"],
+        default=year_default,
+    )
+    if years and selection <= len(years):
+        year = years[selection - 1]
+    else:
+        year = prompt_value("Año a analizar", "")
+    return prompt_year_file_selection(year, available, default_path)
+
+
+def prompt_year_file_selection(
+    year: str,
+    available: Dict[str, Dict[str, List[Path]]],
+    default_path: str,
+) -> Optional[str]:
+    while True:
+        selection = prompt_choice(
+            f"¿Qué archivo deseas revisar para {year}?",
+            ["Rendición", "Postulación", "Volver"],
+        )
+        if selection == 3:
+            return None
+        if selection == 2:
+            print(
+                "Aún no existe código para analizar archivos de postulación. "
+                "Vuelve a seleccionar el tipo de archivo."
+            )
+            continue
+        data_path = select_corrected_file(
+            year, "rendicion", available, default_path
+        )
+        if data_path:
+            return data_path
+
+
+def select_corrected_file(
+    year: str,
+    kind: str,
+    available: Dict[str, Dict[str, List[Path]]],
+    default_path: str,
+) -> Optional[str]:
+    candidates = available.get(year, {}).get(kind, [])
     if not candidates:
-        return prompt_value("Ruta del CSV principal", default_path)
+        print(
+            f"No se encontró un archivo _corregido_final.csv para {kind} en {year}."
+        )
+        manual = prompt_value("Ruta del CSV principal", default_path)
+        if not manual:
+            return None
+        if not manual.endswith("_corregido_final.csv") or not Path(manual).exists():
+            print(
+                "El archivo indicado no existe o no termina en "
+                "_corregido_final.csv."
+            )
+            return None
+        return manual
+    if len(candidates) == 1:
+        return str(candidates[0])
     display = [str(path.relative_to(Path.cwd())) for path in candidates]
-    default_index = None
-    default_path_obj = Path(default_path)
-    if default_path_obj in candidates:
-        default_index = candidates.index(default_path_obj) + 1
     display.append("Ingresar otra ruta manualmente")
     selection = prompt_choice(
-        "Archivos de rendición disponibles:",
+        f"Archivos disponibles de {kind} para {year}:",
         display,
-        default=default_index,
     )
     if selection == len(display):
-        return prompt_value("Ruta del CSV principal", default_path)
+        manual = prompt_value("Ruta del CSV principal", default_path)
+        if not manual:
+            return None
+        if not manual.endswith("_corregido_final.csv") or not Path(manual).exists():
+            print(
+                "El archivo indicado no existe o no termina en "
+                "_corregido_final.csv."
+            )
+            return None
+        return manual
     return str(candidates[selection - 1])
 
 
